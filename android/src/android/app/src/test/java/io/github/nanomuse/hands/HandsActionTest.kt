@@ -112,4 +112,33 @@ class HandsActionTest {
         assertEquals("open 12306", HandsAction.OpenApp("12306").describe())
         assertEquals("done", HandsAction.Status(true, "x").describe())
     }
+
+    @Test fun `an action array is a batch`() {
+        val p = HandsAction.parse(
+            "Thought: three red cars in a row.\n" +
+                "Action: [{\"action_type\":\"click\",\"coordinate\":[100,200],\"target\":\"red car\"}," +
+                "{\"action_type\":\"click\",\"coordinate\":[300,400],\"target\":\"red car\"}," +
+                "{\"action_type\":\"status\",\"goal_status\":\"complete\",\"answer\":\"matched\"}]",
+        )
+        assertEquals(3, p.actions.size)
+        assertEquals(HandsAction.Click(HandsAction.Point(100, 200), "red car"), p.actions[0])
+        assertEquals(p.actions.first(), p.action)
+        assertTrue(p.actions[2] is HandsAction.Status)
+    }
+
+    @Test fun `batches are capped and single objects still parse`() {
+        val many = (1..6).joinToString(",") { "{\"action_type\":\"wait\",\"seconds\":1}" }
+        val p = HandsAction.parse("Action: [$many]")
+        assertEquals(HandsAction.MAX_BATCH, p.actions.size)
+        val single = HandsAction.parse("Action: {\"action_type\":\"navigate_home\"}")
+        assertEquals(1, single.actions.size)
+        assertEquals(HandsAction.Home, single.action)
+    }
+
+    @Test fun `an array inside an action object is not a batch`() {
+        // coordinate is [x, y] — the object must win, not be read as a batch.
+        val p = HandsAction.parse("Action: {\"action_type\":\"click\",\"coordinate\":[500,500],\"target\":\"x\"}")
+        assertEquals(1, p.actions.size)
+        assertEquals(HandsAction.Click(HandsAction.Point(500, 500), "x"), p.action)
+    }
 }
