@@ -125,6 +125,9 @@ class HandsOperator(private val context: Context) {
         eventSession = opts.sessionId
         val traceDir = traceDir(opts.sessionId, runId)
         var lastScreen: String? = null
+        // Fingerprint of the last frame actually SENT to the model — the
+        // dedup state for the PalmClaw live-vision rule.
+        var lastSentPrint: IntArray? = null
         var steps = 0
         val model = Hands.screenModel(context)
         Hands.setActive(true)
@@ -195,7 +198,15 @@ class HandsOperator(private val context: Context) {
                 blackScreens = 0
 
                 // ── think ──
-                val messages = buildMessages(turns, HandsPrompt.turnText(steps, lastResult), jpeg.bytes)
+                // PalmClaw live-vision rule: an unchanged screen is not
+                // re-sent — the model works from the last frame it saw
+                // and pays no image tokens for a duplicate.
+                val unchanged = unchangedSince(jpeg.print, lastSentPrint) && turns.isNotEmpty()
+                val stepText = if (unchanged)
+                    HandsPrompt.turnText(steps, lastResult) + "\n[The screen is UNCHANGED since the previous frame — no new image this step. Act from the last frame you saw.]"
+                else
+                    HandsPrompt.turnText(steps, lastResult)
+                val messages = buildMessages(turns, stepText, if (unchanged) null else jpeg.bytes)
                 where.step = steps
                 val thinkingFrom = System.currentTimeMillis()
                 val reply = try {
@@ -214,170 +225,178 @@ class HandsOperator(private val context: Context) {
                 }
                 val thoughtMs = System.currentTimeMillis() - thinkingFrom
                 if (stop.get()) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
-                val turn = Turn(HandsPrompt.turnText(steps, lastResult), jpeg.bytes, reply)
+                val turn = Turn(stepText, if (unchanged) null else jpeg.bytes, reply)
                 turns += turn
+                if (!unchanged) lastSentPrint = jpeg.print
                 val parsed = try {
                     HandsAction.parse(reply)
                 } catch (e: HandsAction.Companion.FormatError) {
                     formatErrors++
                     if (formatErrors >= 3) return finish(Outcome.Failed("the screen model did not answer in the action format (${e.message})"), steps, runId, lastScreen, traceDir, log, model.label)
-                    lastResult = "your reply could not be read (${e.message}); answer with `Thought:` and one JSON `Action:` only."
+                    lastResult = "your reply could not be read (${e.message}); answer with `Thought:` and one JSON `Action:` (a single object, or a short array of 2-4 objects when the next steps are obvious)."
                     log += "step $steps: unreadable reply"
                     trace(traceDir, steps, "", reply, lastResult, lastScreen)
                     step(runId, steps, "unreadable", "failed", thoughtMs)
                     continue
                 }
                 formatErrors = 0
-                val action = parsed.action
-                capsule.working(steps, parsed.thought.ifBlank { action.describe() }.take(140))
-                log += "step $steps: ${action.describe()}" + (parsed.thought.takeIf { it.isNotBlank() }?.let { " — ${it.take(100)}" } ?: "")
+                val actions = parsed.actions
+                val batch = actions.size > 1
+                val settleTap = if (batch) BATCH_GAP_MS else TAP_SETTLE_MS
+                val settleSwipe = if (batch) BATCH_GAP_MS else SWIPE_SETTLE_MS
+                capsule.working(steps, parsed.thought.ifBlank { actions.first().describe() }.take(140))
+                log += "step $steps: " + (if (batch) "${actions.size}-action batch: " else "") + actions.joinToString("; ") { it.describe() } + (parsed.thought.takeIf { it.isNotBlank() }?.let { " — ${it.take(100)}" } ?: "")
+                for ((batchIdx, action) in actions.withIndex()) {
+                    if (batchIdx > 0) Thread.sleep(BATCH_GAP_MS)
 
-                // ── the same thing again on the same screen? ──
-                when (watch.step(jpeg.print, action)) {
-                    HandsLoopWatch.Verdict.STOP -> {
-                        val why = HandsLoopWatch.stopReason(action)
-                        log += "step $steps: $why"
-                        trace(traceDir, steps, parsed.thought, reply, why, lastScreen)
-                        step(runId, steps, actionWord(action), "stopped", thoughtMs)
-                        return finish(Outcome.Infeasible(why), steps, runId, lastScreen, traceDir, log, model.label)
+                    // ── the same thing again on the same screen? ──
+                    when (watch.step(jpeg.print, action)) {
+                        HandsLoopWatch.Verdict.STOP -> {
+                            val why = HandsLoopWatch.stopReason(action)
+                            log += "step $steps: $why"
+                            trace(traceDir, steps, parsed.thought, reply, why, lastScreen)
+                            step(runId, steps, actionWord(action), "stopped", thoughtMs)
+                            return finish(Outcome.Infeasible(why), steps, runId, lastScreen, traceDir, log, model.label)
+                        }
+                        HandsLoopWatch.Verdict.NOTE -> {
+                            log += "step $steps: the same action on an unchanged screen, ${watch.streak} times running"
+                            loopNote = HandsLoopWatch.NOTE
+                        }
+                        HandsLoopWatch.Verdict.FINE -> loopNote = null
                     }
-                    HandsLoopWatch.Verdict.NOTE -> {
-                        log += "step $steps: the same action on an unchanged screen, ${watch.streak} times running"
-                        loopNote = HandsLoopWatch.NOTE
-                    }
-                    HandsLoopWatch.Verdict.FINE -> loopNote = null
-                }
 
-                // ── act ──
-                when (action) {
-                    is HandsAction.Status -> {
-                        trace(traceDir, steps, parsed.thought, reply, "finished", lastScreen)
-                        return finish(
-                            if (action.complete) Outcome.Done(action.answer.ifBlank { parsed.thought }) else Outcome.Infeasible(action.answer.ifBlank { parsed.thought }),
-                            steps, runId, lastScreen, traceDir, log, model.label,
-                        )
-                    }
-                    is HandsAction.AskUser -> {
-                        trace(traceDir, steps, parsed.thought, reply, "asked the user", lastScreen)
-                        return finish(Outcome.NeedsUser(action.question.ifBlank { parsed.thought }), steps, runId, lastScreen, traceDir, log, model.label)
-                    }
-                    is HandsAction.TakeOver -> {
-                        val cont = waitForUser(action.reason.ifBlank { parsed.thought })
-                        step(runId, steps, "take_over", if (cont) "handed_over" else "stopped", thoughtMs)
-                        if (!cont) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
-                        lastResult = "the user did it themselves and says to continue; look at the screen as it is now."
-                    }
-                    is HandsAction.Click, is HandsAction.DoubleTap, is HandsAction.LongPress -> {
-                        val (px, py) = when (action) {
-                            is HandsAction.Click -> action.at.toPixels(screenW, screenH)
-                            is HandsAction.DoubleTap -> action.at.toPixels(screenW, screenH)
-                            is HandsAction.LongPress -> action.at.toPixels(screenW, screenH)
-                            else -> 0 to 0
+                    // ── act ──
+                    when (action) {
+                        is HandsAction.Status -> {
+                            trace(traceDir, steps, parsed.thought, reply, "finished", lastScreen)
+                            return finish(
+                                if (action.complete) Outcome.Done(action.answer.ifBlank { parsed.thought }) else Outcome.Infeasible(action.answer.ifBlank { parsed.thought }),
+                                steps, runId, lastScreen, traceDir, log, model.label,
+                            )
                         }
-                        // the label the model gave, read next to what the screen itself says is there
-                        val target = action.tapTarget.orEmpty()
-                        val gate = approveTap(svc, opts.sessionId, target, ScreenWords.at(svc, px, py))
-                        if (gate.denied != null) {
-                            trace(traceDir, steps, parsed.thought, reply, "refused: ${gate.denied}", lastScreen)
-                            step(runId, steps, actionWord(action), "refused", thoughtMs)
-                            return finish(Outcome.Infeasible("the user did not allow the tap “${gate.shown.take(40)}” — ${gate.denied}"), steps, runId, lastScreen, traceDir, log, model.label)
+                        is HandsAction.AskUser -> {
+                            trace(traceDir, steps, parsed.thought, reply, "asked the user", lastScreen)
+                            return finish(Outcome.NeedsUser(action.question.ifBlank { parsed.thought }), steps, runId, lastScreen, traceDir, log, model.label)
                         }
-                        // A remembered approval, or a payment that ran on one: the chat model
-                        // sees it in the log and tells the user where it lives.
-                        gate.notice?.let { log += it }
-                        if (stop.get()) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
-                        // The ring first, where the finger is about to land; the capsule steps
-                        // aside when it is in the way and lets the touch through while it lands.
-                        capsule.dodge(px, py)
-                        capsule.stage.aim(px, py, fxLabel(action))
-                        Thread.sleep(AIM_MS)
-                        val ok = capsule.passThrough {
-                            when (action) {
-                                is HandsAction.LongPress -> { capsule.stage.hold(LONG_PRESS_MS); tap(svc, px, py, LONG_PRESS_MS) }
-                                is HandsAction.DoubleTap -> tap(svc, px, py, 50).also { capsule.stage.ripple(px, py); Thread.sleep(90) } && tap(svc, px, py, 50)
-                                else -> tap(svc, px, py, 60)
+                        is HandsAction.TakeOver -> {
+                            val cont = waitForUser(action.reason.ifBlank { parsed.thought })
+                            step(runId, steps, "take_over", if (cont) "handed_over" else "stopped", thoughtMs)
+                            if (!cont) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
+                            lastResult = "the user did it themselves and says to continue; look at the screen as it is now."
+                        }
+                        is HandsAction.Click, is HandsAction.DoubleTap, is HandsAction.LongPress -> {
+                            val (px, py) = when (action) {
+                                is HandsAction.Click -> action.at.toPixels(screenW, screenH)
+                                is HandsAction.DoubleTap -> action.at.toPixels(screenW, screenH)
+                                is HandsAction.LongPress -> action.at.toPixels(screenW, screenH)
+                                else -> 0 to 0
+                            }
+                            // the label the model gave, read next to what the screen itself says is there
+                            val target = action.tapTarget.orEmpty()
+                            val gate = approveTap(svc, opts.sessionId, target, ScreenWords.at(svc, px, py))
+                            if (gate.denied != null) {
+                                trace(traceDir, steps, parsed.thought, reply, "refused: ${gate.denied}", lastScreen)
+                                step(runId, steps, actionWord(action), "refused", thoughtMs)
+                                return finish(Outcome.Infeasible("the user did not allow the tap “${gate.shown.take(40)}” — ${gate.denied}"), steps, runId, lastScreen, traceDir, log, model.label)
+                            }
+                            // A remembered approval, or a payment that ran on one: the chat model
+                            // sees it in the log and tells the user where it lives.
+                            gate.notice?.let { log += it }
+                            if (stop.get()) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
+                            // The ring first, where the finger is about to land; the capsule steps
+                            // aside when it is in the way and lets the touch through while it lands.
+                            capsule.dodge(px, py)
+                            capsule.stage.aim(px, py, fxLabel(action))
+                            Thread.sleep(AIM_MS)
+                            val ok = capsule.passThrough {
+                                when (action) {
+                                    is HandsAction.LongPress -> { capsule.stage.hold(LONG_PRESS_MS); tap(svc, px, py, LONG_PRESS_MS) }
+                                    is HandsAction.DoubleTap -> tap(svc, px, py, 50).also { capsule.stage.ripple(px, py); Thread.sleep(90) } && tap(svc, px, py, 50)
+                                    else -> tap(svc, px, py, 60)
+                                }
+                            }
+                            capsule.stage.ripple(px, py)
+                            lastResult = if (ok) "${action.describe()} at ($px, $py) was performed." else "the gesture at ($px, $py) was rejected by the system; try again or another way."
+                            Thread.sleep(settleTap)
+                        }
+                        is HandsAction.Swipe -> {
+                            val (x1, y1) = action.from.toPixels(screenW, screenH)
+                            val (x2, y2) = action.to.toPixels(screenW, screenH)
+                            val ok = sweep(svc, x1, y1, x2, y2, SWIPE_MS, fxLabel(action))
+                            lastResult = if (ok) "swiped from ($x1, $y1) to ($x2, $y2)." else "the swipe was rejected by the system."
+                            Thread.sleep(settleSwipe)
+                        }
+                        is HandsAction.Scroll -> {
+                            val cx = screenW / 2
+                            val cy = screenH / 2
+                            val dx = screenW * 35 / 100
+                            val dy = screenH * 30 / 100
+                            val (from, to) = when (action.direction) {
+                                "down" -> (cx to cy + dy / 2 + dy / 4) to (cx to cy - dy / 2 - dy / 4)
+                                "up" -> (cx to cy - dy / 2 - dy / 4) to (cx to cy + dy / 2 + dy / 4)
+                                "left" -> (cx + dx to cy) to (cx - dx to cy)
+                                else -> (cx - dx to cy) to (cx + dx to cy)
+                            }
+                            val ok = sweep(svc, from.first, from.second, to.first, to.second, SCROLL_MS, fxLabel(action))
+                            lastResult = if (ok) "scrolled ${action.direction}." else "the scroll was rejected by the system."
+                            Thread.sleep(settleSwipe)
+                        }
+                        is HandsAction.InputText -> {
+                            if (!TapWords.looksSecret(action.field)) capsule.stage.say(fxLabel(action))
+                            lastResult = typeText(svc, action)
+                            if (lastResult == HANDOFF) {
+                                val cont = waitForUser(context.getString(com.openminis.app.R.string.nm_hands_secret_field))
+                                if (!cont) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
+                                lastResult = "that field is a password or code field, which you never type; the user filled it in and says to continue."
+                            }
+                            Thread.sleep(settleTap)
+                        }
+                        HandsAction.KeyboardEnter -> {
+                            // Enter in a messenger's field *is* the send button: the same card a tap on “Send” gets.
+                            val gate = approveEnter(svc, opts.sessionId)
+                            if (gate.denied != null) {
+                                trace(traceDir, steps, parsed.thought, reply, "refused: ${gate.denied}", lastScreen)
+                                step(runId, steps, "enter", "refused", thoughtMs)
+                                return finish(Outcome.Infeasible("the user did not allow sending with Enter — ${gate.denied}"), steps, runId, lastScreen, traceDir, log, model.label)
+                            }
+                            gate.notice?.let { log += it }
+                            if (stop.get()) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
+                            capsule.stage.say(fxLabel(action))
+                            lastResult = pressEnter(svc)
+                            Thread.sleep(settleTap)
+                        }
+                        is HandsAction.OpenApp -> {
+                            val app = HandsApps.resolve(context, action.appName)
+                            lastResult = if (app != null && HandsApps.open(context, app)) {
+                                capsule.stage.say(context.getString(com.openminis.app.R.string.nm_hands_fx_open, app.label))
+                                Thread.sleep(OPEN_APP_SETTLE_MS); "opened ${app.label}."
+                            } else {
+                                "no installed app matches “${action.appName}”. Installed: " + apps.take(40).joinToString(", ") { it.label } + ". Open it from the home screen if you must."
                             }
                         }
-                        capsule.stage.ripple(px, py)
-                        lastResult = if (ok) "${action.describe()} at ($px, $py) was performed." else "the gesture at ($px, $py) was rejected by the system; try again or another way."
-                        Thread.sleep(TAP_SETTLE_MS)
-                    }
-                    is HandsAction.Swipe -> {
-                        val (x1, y1) = action.from.toPixels(screenW, screenH)
-                        val (x2, y2) = action.to.toPixels(screenW, screenH)
-                        val ok = sweep(svc, x1, y1, x2, y2, SWIPE_MS, fxLabel(action))
-                        lastResult = if (ok) "swiped from ($x1, $y1) to ($x2, $y2)." else "the swipe was rejected by the system."
-                        Thread.sleep(SWIPE_SETTLE_MS)
-                    }
-                    is HandsAction.Scroll -> {
-                        val cx = screenW / 2
-                        val cy = screenH / 2
-                        val dx = screenW * 35 / 100
-                        val dy = screenH * 30 / 100
-                        val (from, to) = when (action.direction) {
-                            "down" -> (cx to cy + dy / 2 + dy / 4) to (cx to cy - dy / 2 - dy / 4)
-                            "up" -> (cx to cy - dy / 2 - dy / 4) to (cx to cy + dy / 2 + dy / 4)
-                            "left" -> (cx + dx to cy) to (cx - dx to cy)
-                            else -> (cx - dx to cy) to (cx + dx to cy)
+                        HandsAction.Back -> {
+                            capsule.stage.say(fxLabel(action))
+                            svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                            lastResult = "pressed Back."
+                            Thread.sleep(settleTap)
                         }
-                        val ok = sweep(svc, from.first, from.second, to.first, to.second, SCROLL_MS, fxLabel(action))
-                        lastResult = if (ok) "scrolled ${action.direction}." else "the scroll was rejected by the system."
-                        Thread.sleep(SWIPE_SETTLE_MS)
-                    }
-                    is HandsAction.InputText -> {
-                        if (!TapWords.looksSecret(action.field)) capsule.stage.say(fxLabel(action))
-                        lastResult = typeText(svc, action)
-                        if (lastResult == HANDOFF) {
-                            val cont = waitForUser(context.getString(com.openminis.app.R.string.nm_hands_secret_field))
-                            if (!cont) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
-                            lastResult = "that field is a password or code field, which you never type; the user filled it in and says to continue."
+                        HandsAction.Home -> {
+                            capsule.stage.say(fxLabel(action))
+                            svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+                            lastResult = "went to the home screen."
+                            Thread.sleep(settleTap)
                         }
-                        Thread.sleep(TAP_SETTLE_MS)
-                    }
-                    HandsAction.KeyboardEnter -> {
-                        // Enter in a messenger's field *is* the send button: the same card a tap on “Send” gets.
-                        val gate = approveEnter(svc, opts.sessionId)
-                        if (gate.denied != null) {
-                            trace(traceDir, steps, parsed.thought, reply, "refused: ${gate.denied}", lastScreen)
-                            step(runId, steps, "enter", "refused", thoughtMs)
-                            return finish(Outcome.Infeasible("the user did not allow sending with Enter — ${gate.denied}"), steps, runId, lastScreen, traceDir, log, model.label)
-                        }
-                        gate.notice?.let { log += it }
-                        if (stop.get()) return finish(Outcome.Stopped(stopReason.get() ?: "stopped"), steps, runId, lastScreen, traceDir, log, model.label)
-                        capsule.stage.say(fxLabel(action))
-                        lastResult = pressEnter(svc)
-                        Thread.sleep(TAP_SETTLE_MS)
-                    }
-                    is HandsAction.OpenApp -> {
-                        val app = HandsApps.resolve(context, action.appName)
-                        lastResult = if (app != null && HandsApps.open(context, app)) {
-                            capsule.stage.say(context.getString(com.openminis.app.R.string.nm_hands_fx_open, app.label))
-                            Thread.sleep(OPEN_APP_SETTLE_MS); "opened ${app.label}."
-                        } else {
-                            "no installed app matches “${action.appName}”. Installed: " + apps.take(40).joinToString(", ") { it.label } + ". Open it from the home screen if you must."
+                        is HandsAction.Wait -> {
+                            capsule.stage.say(fxLabel(action))
+                            Thread.sleep(action.seconds * 1000L)
+                            lastResult = "waited ${action.seconds}s."
                         }
                     }
-                    HandsAction.Back -> {
-                        capsule.stage.say(fxLabel(action))
-                        svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-                        lastResult = "pressed Back."
-                        Thread.sleep(TAP_SETTLE_MS)
-                    }
-                    HandsAction.Home -> {
-                        capsule.stage.say(fxLabel(action))
-                        svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-                        lastResult = "went to the home screen."
-                        Thread.sleep(TAP_SETTLE_MS)
-                    }
-                    is HandsAction.Wait -> {
-                        capsule.stage.say(fxLabel(action))
-                        Thread.sleep(action.seconds * 1000L)
-                        lastResult = "waited ${action.seconds}s."
-                    }
+                    loopNote?.let { note -> lastResult = listOfNotNull(lastResult, note).joinToString(" ") }
+                    if (batch) lastResult = "(${batchIdx + 1}/${actions.size}) $lastResult"
+                    trace(traceDir, steps, parsed.thought, reply, lastResult ?: "", lastScreen)
+                    if (action !is HandsAction.TakeOver) step(runId, steps, actionWord(action), if (lastResult?.contains("rejected by the system") == true) "failed" else "ok", thoughtMs)
                 }
-                loopNote?.let { note -> lastResult = listOfNotNull(lastResult, note).joinToString(" ") }
-                trace(traceDir, steps, parsed.thought, reply, lastResult ?: "", lastScreen)
-                if (action !is HandsAction.TakeOver) step(runId, steps, actionWord(action), if (lastResult?.contains("rejected by the system") == true) "failed" else "ok", thoughtMs)
             }
             return finish(Outcome.Infeasible("the step limit (${opts.maxSteps}) was reached before the task was done"), steps, runId, lastScreen, traceDir, log, model.label, end = "max_steps")
         } catch (t: Throwable) {
@@ -598,16 +617,34 @@ class HandsOperator(private val context: Context) {
     /** [print]: the grey level of each sampled cell, the fingerprint [HandsLoopWatch] compares. */
     private class Jpeg(val bytes: ByteArray, val black: Boolean, val print: IntArray)
 
-    /** Down to [SHOT_WIDTH] px wide (the grid is relative, so nothing is lost for tapping) and JPEG. */
+    /** Down to [SHOT_MAX_SIDE] px on the LONGEST side and JPEG — the
+     * PalmClaw field-proven capture recipe: on a 1080×2400 phone this is
+     * a 360×800 frame (~0.29 Mpx), the size PalmClaw shipped for the
+     * same device, roughly a quarter of the image tokens the previous
+     * 720-wide policy billed per step. The grid is relative, so nothing
+     * is lost for tapping. */
     private fun encode(shot: Bitmap): Jpeg {
-        val scale = SHOT_WIDTH.toFloat() / shot.width
-        val scaled = if (scale < 1f) Bitmap.createScaledBitmap(shot, SHOT_WIDTH, (shot.height * scale).toInt().coerceAtLeast(1), true) else shot
+        val longest = maxOf(shot.width, shot.height)
+        val scale = if (longest > SHOT_MAX_SIDE) SHOT_MAX_SIDE.toFloat() / longest else 1f
+        val scaled = if (scale < 1f)
+            Bitmap.createScaledBitmap(shot, (shot.width * scale).toInt().coerceAtLeast(1), (shot.height * scale).toInt().coerceAtLeast(1), true)
+        else shot
         val print = sample(scaled)
         val black = looksBlack(print)
         val out = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
         if (scaled !== shot) scaled.recycle()
         return Jpeg(out.toByteArray(), black, print)
+    }
+
+    /** True when [print] is cell-for-cell near [last]: the screen
+     * did not visibly change, so the model would be billed the same image
+     * twice (PalmClaw's live-vision dedup rule: unchanged frames are not
+     * re-sent). */
+    private fun unchangedSince(print: IntArray, last: IntArray?): Boolean {
+        if (last == null || last.size != print.size || print.isEmpty()) return false
+        val near = print.indices.count { kotlin.math.abs(print[it] - last[it]) <= 4 }
+        return near * 100 / print.size >= 99
     }
 
     /** A grid of 12 × 20 pixels, each as a grey level 0–255: enough to tell a black frame and an unchanged screen. */
@@ -635,7 +672,7 @@ class HandsOperator(private val context: Context) {
         return dark * 100 / print.size >= 98
     }
 
-    private fun buildMessages(turns: List<Turn>, currentText: String, current: ByteArray): List<LLMMessage> {
+    private fun buildMessages(turns: List<Turn>, currentText: String, current: ByteArray?): List<LLMMessage> {
         val out = mutableListOf<LLMMessage>()
         val withImage = turns.size - HISTORY_IMAGES
         turns.forEachIndexed { i, t ->
@@ -648,7 +685,10 @@ class HandsOperator(private val context: Context) {
         out += LLMMessage(
             LLMMessage.Role.USER,
             content = currentText,
-            contentParts = listOf(AgentContentPart.Text(currentText), AgentContentPart.ImageData(current, "image/jpeg")),
+            contentParts = if (current != null)
+                listOf(AgentContentPart.Text(currentText), AgentContentPart.ImageData(current, "image/jpeg"))
+            else
+                listOf(AgentContentPart.Text(currentText)),
         )
         return out
     }
@@ -687,15 +727,18 @@ class HandsOperator(private val context: Context) {
         /** No step cap: a task takes as many steps as it takes (the time limit and the Stop button remain). */
         const val DEFAULT_MAX_STEPS = 0
         private const val MAX_APPS_IN_PROMPT = 120
-        private const val SHOT_WIDTH = 720
-        private const val JPEG_QUALITY = 78
+        /** Longest side of a sent frame — PalmClaw's field-proven budget. */
+        private const val SHOT_MAX_SIDE = 800
+        private const val JPEG_QUALITY = 85
         private const val HISTORY_IMAGES = 1
         private const val MODEL_TIMEOUT_MS = 90_000L
         private const val TAKE_OVER_TIMEOUT_MS = 5 * 60_000L
         private const val MAX_RUN_MS = 30 * 60_000L
-        private const val TAP_SETTLE_MS = 900L
-        private const val SWIPE_SETTLE_MS = 1100L
-        private const val OPEN_APP_SETTLE_MS = 1800L
+        private const val TAP_SETTLE_MS = 500L
+        private const val SWIPE_SETTLE_MS = 650L
+        private const val OPEN_APP_SETTLE_MS = 1000L
+        /** Breathing room between the actions of one batch (fast, human-paced). */
+        private const val BATCH_GAP_MS = 250L
         /** The ring shows this long before the finger lands, so the eye gets there first. */
         private const val AIM_MS = 260L
         private const val LONG_PRESS_MS = 900L

@@ -65,8 +65,13 @@ sealed class HandsAction {
     companion object {
         const val GRID = 1000
 
-        /** `Thought:` and `Action:` pulled out of a reply. */
-        data class Parsed(val thought: String, val action: HandsAction, val raw: String)
+        /** `Thought:` and `Action:` pulled out of a reply. [actions] carries the batch
+         *  when the model answered with a JSON array; [action] stays the first of them
+         *  so single-action callers are unaffected. */
+        data class Parsed(val thought: String, val action: HandsAction, val raw: String, val actions: List<HandsAction> = listOf(action))
+
+        /** How many actions one reply may batch (speed: one round trip per batch). */
+        const val MAX_BATCH = 4
 
         class FormatError(message: String) : Exception(message)
 
@@ -90,6 +95,9 @@ sealed class HandsAction {
         /**
          * Reads a reply of the form `Thought: … Action: {json}`. Tolerant of a missing
          * `Thought:` label, of a fenced code block around the JSON and of text after it.
+         * Also reads a SHORT BATCH — `Action: [{json}, {json}]` (at most [MAX_BATCH]
+         * actions) — which the operator executes in order with one verification
+         * screenshot after the whole batch, instead of one round trip per action.
          */
         fun parse(reply: String): Parsed {
             val text = reply.trim()
@@ -97,9 +105,52 @@ sealed class HandsAction {
             if (idx < 0) throw FormatError("no `Action:` line")
             var thought = text.substring(0, idx).replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
             if (thought.startsWith("Thought:")) thought = thought.removePrefix("Thought:").trim()
-            val json = extractJson(text.substring(idx + "Action:".length))
+            val tail = text.substring(idx + "Action:".length)
+            val array = extractJsonArray(tail)
+            if (array != null) {
+                if (array.length() == 0) throw FormatError("the action array is empty")
+                val list = (0 until array.length())
+                    .mapNotNull { i -> array.optJSONObject(i) }
+                    .map { o -> fromJson(o) }
+                if (list.isEmpty()) throw FormatError("the action array has no JSON objects")
+                val capped = list.take(MAX_BATCH)
+                return Parsed(thought, capped.first(), text, capped)
+            }
+            val json = extractJson(tail)
                 ?: throw FormatError("the action is not a JSON object")
             return Parsed(thought, fromJson(json), text)
+        }
+
+        /** A JSON array of actions, when it starts before any object does; null otherwise. */
+        internal fun extractJsonArray(tail: String): JSONArray? {
+            val s = tail.trim().removePrefix("```json").removePrefix("```").trim()
+            val start = s.indexOf('[')
+            if (start < 0) return null
+            val objStart = s.indexOf('{')
+            if (objStart in 0 until start) return null
+            var depth = 0
+            var inString = false
+            var escaped = false
+            for (i in start until s.length) {
+                val c = s[i]
+                if (inString) {
+                    when {
+                        escaped -> escaped = false
+                        c == '\\' -> escaped = true
+                        c == '"' -> inString = false
+                    }
+                    continue
+                }
+                when (c) {
+                    '"' -> inString = true
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) return runCatching { JSONArray(s.substring(start, i + 1)) }.getOrNull()
+                    }
+                }
+            }
+            return null
         }
 
         internal fun extractJson(tail: String): JSONObject? {
