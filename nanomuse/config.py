@@ -246,7 +246,10 @@ class AgentSettings(BaseModel):
     # conversation goes up again on every step: a dozen 4K screenshots passed the relay's
     # body limit (0.1.37, 413 too_large). Older ones are replaced by a short note so the
     # model still knows a screenshot was there. 0 = keep every picture.
-    max_context_images: int = 4
+    # 2 = PalmClaw parity: only the newest two image-bearing messages ride
+    # a request; older frames degrade to notes (halves image-token spend
+    # on screen-driven loops without hurting act-then-verify).
+    max_context_images: int = 2
     show_thinking: bool = False
     # Optional free-text profile injected into the system prompt.
     user_profile: str = ""
