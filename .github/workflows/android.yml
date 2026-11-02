@@ -116,16 +116,15 @@ jobs:
                   val elements = collectElements(svc, screenW, screenH)
                   if (elements.isEmpty()) return ""
                   val sb = StringBuilder()
-                  sb.append("Visible UI elements on 0–999 grid (use these exact [x, y] coordinates when tapping matching targets):
-          ")
+                  sb.append("Visible UI elements on 0–999 grid (use these exact [x, y] coordinates when tapping matching targets):\n")
                   for (el in elements.take(limit)) {
                       val flags = mutableListOf<String>()
                       if (el.clickable) flags.add("clickable")
                       if (el.editable) flags.add("editable")
                       if (el.selected) flags.add("selected")
-                      val flagStr = if (flags.isNotEmpty()) " [${flags.joinToString(", ")}]" else ""
-                      sb.append("- "${el.label.replace(""", "'")}" · ${el.kind}$flagStr @ [${el.gx}, ${el.gy}]
-          ")
+                      val flagStr = if (flags.isNotEmpty()) " [" + flags.joinToString(", ") + "]" else ""
+                      val cleanLabel = el.label.replace('"', '\'')
+                      sb.append("- \"$cleanLabel\" · ${el.kind}$flagStr @ [${el.gx}, ${el.gy}]\n")
                   }
                   return sb.toString().trimEnd()
               }
