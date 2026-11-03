@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-apk:
-    name: Build & Upload Fast-Vision nanoMuse APK
+    name: Build & Upload Ultra-Light Fast-Vision nanoMuse APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -34,7 +34,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Apply Fast-Vision Architecture (Hands + Linux android-a11y-cli)
+      - name: Apply Ultra-Light Fast-Vision & 1-to-3 Screenshots Rule (Hands + android-a11y-cli)
         run: |
           HANDS_MAIN="android/src/android/app/src/main/java/io/github/nanomuse/hands"
           HANDS_TEST="android/src/android/app/src/test/java/io/github/nanomuse/hands"
@@ -262,16 +262,20 @@ jobs:
                   val on = enabled(context)
                   val r = readiness(context)
                   return buildString {
-                      append("## Apps without an API — the ladder (nanoMuse)\n")
-                      append("Most everyday apps here (12306, 微信, 支付宝, 美团, 淘宝, 京东…) have no API. Climb in this order and say which rung you are on before you start: ")
-                      append("(1) a skill, a CLI or an MCP server; (2) the page fetched with the user's login or `browser_use`; (3) the phone's own screen, last. ")
-                      append("A task is rarely all screen: find the number with a command, the button with the screen, and ask before it is pressed.\n")
+                      append("## Direct Screen Vision & Control — Zero Linux Overhead & 1–3 Screenshots Rule\n")
+                      append("When a task involves opening an Android app, calculator, cloner (e.g. Clone Space), or playing a game:\n")
+                      append("- ISOLATE FROM LINUX OVERHEAD: Do NOT run exploratory Linux commands (`ls`, `find`, `which`, `python3`, `cat`) before or during screen operation. Go straight to the screen vision tool to save time and tokens!\n")
+                      append("- 1 TO 3 SCREENSHOTS SUFFICIENCY RULE: Whenever the rules of the task or game are clear from the first screenshot(s) and the visible elements on screen are static in their positions (not moving targets — e.g. calculator/keypad buttons, app icons, forms, or static puzzle/board pieces like Car Match), **1 to 3 screenshots are completely sufficient** to finish the goal! Plan and execute the full sequence of taps (up to 24 taps in one batch at 140ms intervals) from a single screenshot rather than taking a new screenshot after every tap.\n")
                       if (on && r.ready) {
-                          append("The screen is available: `nanomuse-hands run --task \"<one clear task, with every detail the hands need>\" [--app \"<app name>\"]` ")
-                          append("(screen model: ${r.model?.label}). It looks at screenshots — never the accessibility tree — and taps, types and swipes; a capsule with Stop shows the user what it does. ")
-                          append("It never types passwords, codes or card numbers: for a login or a code it hands the phone to the user and waits. Taps that pay, send, post or delete go through the same approval card as the shell and the browser. ")
-                          append("It returns JSON: `outcome` is done (with `answer`), stopped (the user tapped Stop — do not restart it), needs_user (`question` — relay it and wait), infeasible or failed (with `message`); `last_screen` is a picture you can show with `![screen](<last_screen>)`. ")
-                          append("Tell the user in one line that you are about to use the screen and which app, then run it; give one task per run, and never a payment as the task. `nanomuse-hands apps` lists the installed apps; `nanomuse-hands status` says what is set up.")
+                          append("- ACTIVE VISION SYSTEM (Hands Fast-Vision Engine): Run `nanomuse-hands run --task \"<clear goal — instruct it to batch all static moves in 1–3 screenshots>\" [--app \"<app name>\"]` (screen model: ${r.model?.label}). ")
+                          append("It executes multi-step plans (up to 24 taps per batch at 140ms) directly in Android RAM with zero Linux overhead, calibrated 0–999 grid, UI + game object tracking (`u1..uN`, `c1..cN`, `green_btn`), and Touch Contract protection. ")
+                          append("Tell the user in one short line that you are starting, then call `nanomuse-hands run` once.")
+                      } else if (r.serviceOn) {
+                          append("- ACTIVE VISION SYSTEM (Direct Fast-Vision CLI `android-a11y-cli` + `read_image`, Hands sub-agent is OFF): ")
+                          append("Accomplish the entire screen task or game level in **1 to 3 screenshots** using these direct commands without any Linux scripting overhead:\n")
+                          append("  1. `android-a11y-cli open \"<app name>\"` — opens the app with sticky-session protection (never relaunches if already open).\n")
+                          append("  2. `android-a11y-cli ui screenshot` — captures the calibrated 0–999 grid + `fastVisionState` JSON (`ui_elements` u1..uN, `green_button`, `tracked_objects` c1..cN) and saves `/var/minis/attachments/a11y/screen_latest.jpg`. Call `read_image` on `/var/minis/attachments/a11y/screen_latest.jpg` only when you need to visually inspect a game board.\n")
+                          append("  3. `android-a11y-cli tap batch <t1> <t2> ...` — executes up to 24 taps in ONE fast batch at 140ms human speed! Each target can be an exact button label (`\"6\"`, `\"0\"`, `\"+\"`, `\"=\"`), a tracked ID (`green_btn`, `c1`, `u1`), or a 0–999 coordinate `gx,gy` (e.g. `500,768`). When elements are static (like Calculator keys or unblocked game pieces with eyes 👀), send the ENTIRE sequence of taps in ONE `tap batch` command so the task finishes in 1 to 3 screenshots!")
                       } else if (on) {
                           val missing = buildList {
                               if (!r.androidOk) add("Android 11 or newer")
@@ -279,14 +283,9 @@ jobs:
                               if (!r.overlayOk) add("no permission to draw over other apps")
                               if (r.model == null) add("no model that can see pictures")
                           }.joinToString(", ")
-                          append("The screen is switched on but not usable yet ($missing). If a task needs it, say so in one line and give the link [Hands]($DEEP_LINK) — it opens the setting; do not try android-a11y-cli instead.")
-                      } else if (r.serviceOn) {
-                          append("The Hands sub-agent switch is off; use the direct Fast-Vision Linux CLI `android-a11y-cli` + `read_image` as your exclusive screen vision and control system:\n")
-                          append("- `android-a11y-cli open \"<app name>\"` — opens an app with sticky-session protection (never relaunches if already in foreground).\n")
-                          append("- `android-a11y-cli ui screenshot` — captures the live screen with the calibrated 0–999 yellow grid, tracked object IDs (`green_btn`, `c1..cN`, `u1..uN`), and `LAST_TAP` bullseye, saves it directly to `/var/minis/attachments/a11y/screen_latest.jpg` (and `/var/minis/shared/screen_latest.jpg`), and returns the full `fastVisionState` JSON (`ui_elements`, `green_button`, `tracked_objects`). Call `read_image` on `/var/minis/attachments/a11y/screen_latest.jpg` whenever you need to visually inspect the screen or solve a game board.\n")
-                          append("- `android-a11y-cli tap batch <target1> <target2> ...` — executes 1 to 12 taps at 150ms human speed with Touch Contract protection! Each target can be a 0–999 grid coordinate `gx,gy` (e.g. `500,768`), a tracked ID (`green_btn`, `c1`, `u1`), or an exact UI button label (`\"6\"`, `\"0\"`, `\"+\"`, `\"=\"`). Always batch obvious multi-step sequences (like calculator digits or unblocked game pieces with eyes 👀) in one `tap batch` call!")
+                          append("The screen is switched on but not usable yet ($missing). Tell the user in one line and give the link [Hands]($DEEP_LINK).")
                       } else {
-                          append("Operating the phone's screen is switched off (the default). If a task can only be done on the screen, say so in one line and give the link [Hands]($DEEP_LINK) so the user can switch it on.")
+                          append("Operating the phone's screen is switched off. Tell the user in one line and give the link [Hands]($DEEP_LINK) or enable Accessibility Service.")
                       }
                   }
               }
@@ -1124,7 +1123,7 @@ jobs:
                   data class Parsed(val thought: String, val action: HandsAction, val raw: String, val actions: List<HandsAction> = listOf(action))
 
                   /** How many actions one reply may batch in a single fast plan (`hands-fast-vision.md`). */
-                  const val MAX_BATCH = 12
+                  const val MAX_BATCH = 24
 
                   class FormatError(message: String) : Exception(message)
 
@@ -1347,57 +1346,50 @@ jobs:
           package io.github.nanomuse.hands
 
           /**
-           * Implements the `hands-fast-vision.md` Plan-Once / Fast-Hand prompt contract:
-           * The model acts as the strategic planner ("العقل النادر") while the local device
-           * executes multi-step tap plans at human speed (150ms between taps) with local
-           * motion verification and Touch Contract protection.
+           * Ultra-Light Fast-Vision Prompt (`hands-fast-vision.md` + 1-to-3 Screenshots Sufficiency Rule):
+           * Isolates screen control from Linux overhead, minimizes token consumption, and instructs the
+           * agent to complete any static UI task or game level in 1 to 3 screenshots by dispatching full
+           * action sequences (up to 24 steps per batch at 140ms human speed).
            */
           object HandsPrompt {
               fun system(task: String, apps: List<String>, agentName: String, language: String): String = buildString {
-                  append("You are the hands of $agentName on the user's Android phone, powered by the Fast-Vision Human-Response Architecture (hands-fast-vision). ")
-                  append("You see the current screenshot overlaid with: (1) a calibrated 0–999 yellow coordinate grid `x,y`, (2) tracked object IDs (`green_btn`, `c1..cN`, `u1..uN`), and (3) a red/cyan bullseye marker `LAST_TAP` showing where your previous tap landed.\n\n")
+                  append("You are the Fast-Vision Hands of $agentName on Android. ")
+                  append("You see the live screenshot with a 0–999 yellow grid `x,y`, tracked IDs (`green_btn`, `c1..cN`, `u1..uN`), and `LAST_TAP` bullseye, plus the Local Fast-Vision JSON state.\n\n")
                   append("## Task\n").append(task.trim()).append("\n\n")
-                  append("## Fast-Vision Architecture: Plan Once, Execute Locally at Human Speed (150ms)\n")
-                  append("Do NOT tap one item at a time and wait when multiple valid moves are visible! Solve as much of the visible board as possible in ONE turn and output a multi-step JSON array (2 to 12 actions) in `Action: [...]`. The phone executes your plan locally at 150ms per tap, verifies motion after each tap, retries missed taps locally, and stops automatically if a new screen/popup appears.\n\n")
-                  append("Reply in exactly this form and nothing else:\n")
-                  append("Thought: 1-2 concise sentences — (1) current screen/dock state & whether LAST_TAP hit its target, (2) which pieces are UNBLOCKED/FREE right now (in Car Match: ONLY cars with cartoon eyes 👀 on their windshield) and the multi-step sequence you will execute.\n")
-                  append("Action: [{\"action_type\":\"click\",\"id\":\"c3\",\"coordinate\":[500,560],\"target\":\"yellow car\",\"gap_ms\":150}, ...]\n")
-                  append("(Or a single JSON object `Action: {\"action_type\":\"...\"}` when only 1 action is appropriate, such as tapping `green_btn` to start a level or `status` when complete.)\n\n")
-                  append("## Actions (0–999 grid + Object IDs)\n")
-                  append("Coordinates are on a 0–999 grid laid over the screenshot: x from left (0) to right (999), y from top (0) to bottom (999).\n")
-                  append("- {\"action_type\":\"click\",\"id\":\"optional_id (e.g. green_btn, c1, u1)\",\"coordinate\":[x,y],\"target\":\"what you tap\",\"gap_ms\":150}\n")
-                  append("- {\"action_type\":\"long_press\",\"coordinate\":[x,y],\"target\":\"...\"}\n")
-                  append("- {\"action_type\":\"double_tap\",\"coordinate\":[x,y],\"target\":\"...\"}\n")
-                  append("- {\"action_type\":\"swipe\",\"start_coordinate\":[x,y],\"end_coordinate\":[x,y]}\n")
-                  append("- {\"action_type\":\"scroll\",\"direction\":\"down\"} (up, down, left, right)\n")
-                  append("- {\"action_type\":\"input_text\",\"text\":\"...\",\"field\":\"what the field is\"}\n")
-                  append("- {\"action_type\":\"keyboard_enter\"}\n")
-                  append("- {\"action_type\":\"open_app\",\"app_name\":\"...\"} — ONLY use if the app is NOT already on screen!\n")
-                  append("- {\"action_type\":\"navigate_back\"} · {\"action_type\":\"navigate_home\"} · {\"action_type\":\"wait\",\"seconds\":1}\n")
-                  append("- {\"action_type\":\"take_over\",\"reason\":\"...\"}\n")
-                  append("- {\"action_type\":\"ask_user\",\"question\":\"...\"}\n")
-                  append("- {\"action_type\":\"status\",\"goal_status\":\"complete\",\"answer\":\"...\"}\n")
-                  append("- {\"action_type\":\"status\",\"goal_status\":\"infeasible\",\"answer\":\"why\"}\n\n")
+                  append("## GOLDEN RULE: Finish Static UI Tasks & Game Boards in 1 to 3 Screenshots!\n")
+                  append("When the rules of the task or game are clear from the first screenshot(s) and the visible elements on screen are in static positions (not moving targets — e.g. calculator/keypad buttons, app icons, menus, forms, or static puzzle/board pieces), **1 to 3 screenshots are completely sufficient** to achieve the user's goal!\n")
+                  append("- On Screenshot #1: Understand the screen/rules and send the FULL sequence of valid actions (up to 24 steps in `Action: [...]` with `\"gap_ms\": 140`) in ONE turn!\n")
+                  append("  * Calculator / Keypads / Forms: See all keys in Screenshot #1 and send the ENTIRE sequence (e.g. `6`, `0`, `0`, `+`, `3`, `5`, `=`) in ONE `Action: [...]` batch! Then on Screenshot #2, read the result and finish with `status: complete`.\n")
+                  append("  * Games & Puzzles (e.g. Car Match, Match-3, Board games): In Screenshot #1, locate ALL currently unblocked/free pieces (in Car Match: ONLY cars with cartoon eyes 👀 on their windshield) that form valid matches of 3, and send all those taps (up to 24 taps) in ONE batch! Use Screenshot #2 (and #3 if needed) only to clear newly unlocked pieces or tunnel spawns and finish the level.\n\n")
+                  append("## Reply Format (Strict)\n")
+                  append("Thought: 1-2 short sentences — (1) current screen state & rule, (2) full sequence of static/unblocked targets you will execute now.\n")
+                  append("Action: [{\"action_type\":\"click\",\"id\":\"u12\",\"coordinate\":[x,y],\"target\":\"label\",\"gap_ms\":140}, ...]\n")
+                  append("(Or a single object `Action: {\"action_type\":\"...\"}` when only 1 step is needed.)\n\n")
+                  append("## Actions (0–999 grid + IDs)\n")
+                  append("- {\"action_type\":\"click\",\"id\":\"optional_id\",\"coordinate\":[x,y],\"target\":\"exact label/piece\",\"gap_ms\":140}\n")
+                  append("- {\"action_type\":\"long_press\",\"coordinate\":[x,y],\"target\":\"...\"} · {\"action_type\":\"double_tap\",\"coordinate\":[x,y],\"target\":\"...\"}\n")
+                  append("- {\"action_type\":\"swipe\",\"start_coordinate\":[x,y],\"end_coordinate\":[x,y]} · {\"action_type\":\"scroll\",\"direction\":\"down|up|left|right\"}\n")
+                  append("- {\"action_type\":\"input_text\",\"text\":\"...\",\"field\":\"...\"} · {\"action_type\":\"keyboard_enter\"}\n")
+                  append("- {\"action_type\":\"open_app\",\"app_name\":\"...\"} (ONLY if the app is NOT already on screen!)\n")
+                  append("- {\"action_type\":\"navigate_back\"} · {\"action_type\":\"navigate_home\"} · {\"action_type\":\"wait\",\"seconds\":2}\n")
+                  append("- {\"action_type\":\"take_over\",\"reason\":\"...\"} · {\"action_type\":\"ask_user\",\"question\":\"...\"}\n")
+                  append("- {\"action_type\":\"status\",\"goal_status\":\"complete\",\"answer\":\"result in $language\"} · {\"action_type\":\"status\",\"goal_status\":\"infeasible\",\"answer\":\"why\"}\n\n")
                   if (apps.isNotEmpty()) {
-                      append("## Installed apps\n")
-                      append(apps.joinToString(", ")).append("\n\n")
+                      append("## Installed apps\n").append(apps.joinToString(", ")).append("\n\n")
                   }
-                  append("## Universal Touch, App & Game Rules\n")
-                  append("1. UNIVERSAL APP & UI PRECISION: In any standard app (messengers, browsers, settings, cloners like Clone Space, shopping, productivity), check `ui_elements` (`u1..uN`) in the Local Fast-Vision State and use the exact `@ [x, y]` coordinate and `id` of the button, field, or icon you want to tap. You can batch obvious UI sequences (e.g. tap a search box then `input_text` then `keyboard_enter`) in one `Action: [...]` array.\n")
-                  append("2. STICKY SESSION (NO RE-LAUNCHING): If the target app or game is ALREADY open on screen, NEVER call `open_app` or navigate home — continue directly from the current screen!\n")
-                  append("3. UNIVERSAL GAME & PUZZLE INTELLIGENCE: In any game (puzzle, match-3, board, strategy, arcade, or Car Match), analyze the rules, board constraints, and active pieces before acting: (a) only interact with UNBLOCKED / ACTIVE pieces (e.g. in Car Match, only cars with cartoon eyes 👀 on their windshield have an open exit path — never tap blocked cars without eyes), (b) batch 2 to 12 independent valid moves together with `\"gap_ms\": 150` for human-like speed, and (c) avoid accidental taps on HUD Coin/Shop/Settings bars unless explicitly asked.\n")
-                  append("4. STRICT GOAL BOUNDARY: The moment the user's requested task, message, or game level is completed, STOP immediately with `{\"action_type\":\"status\",\"goal_status\":\"complete\",\"answer\":\"...\"}` in $language.\n")
-                  append("5. SAFETY & PRIVACY: Never type passwords, PINs, or verification codes (use `take_over`), and before any tap that pays, places an order, sends a message, or deletes data, put the exact button text in `\"target\"` so the user's approval card can verify it.\n")
+                  append("## Precision & Safety Contract\n")
+                  append("1. STICKY SESSION: Never call `open_app` if the target app/game is already visible on screen.\n")
+                  append("2. EXACT UI & GAME TARGETING: For standard app buttons (`u1..uN`), copy both `id` and `@ [x, y]` and put the exact button text (e.g. `\"6\"`, `\"0\"`, `\"+\"`, `\"=\"`, `\"Car Match\"`) in `\"target\"`. For games, never tap HUD Coin (+), Shop, or Settings bars, and never tap blocked pieces (e.g. cars without eyes 👀).\n")
+                  append("3. STOP IMMEDIATELY WHEN DONE: Once the requested calculation, action, or game level is complete, return `status: complete` with the answer. Never type passwords/codes (`take_over`), and name pay/send/delete buttons accurately in `\"target\"`.\n")
               }
 
-              /** The text that goes with a screenshot: the step number and what the last action did. */
               fun turnText(step: Int, lastResult: String?): String = buildString {
                   append("Step ").append(step).append(". ")
-                  if (lastResult != null) append("Result of the last action: ").append(lastResult).append(" ")
-                  append("Here is the screen now.")
+                  if (lastResult != null) append("Last: ").append(lastResult).append(" ")
+                  append("Screen now:")
               }
 
-              const val OLDER_SCREEN = "(An earlier screen — not shown again.)"
+              const val OLDER_SCREEN = "(earlier screen omitted to save tokens)"
           }
           EOF_HANDS_PROMPT
 
@@ -1559,7 +1551,8 @@ jobs:
                       if (model == null) return finish(Outcome.Failed("no model that can see pictures is configured"), steps, runId, lastScreen, traceDir, log, null)
                       val provider = ProviderFactory.create(model.instance, model.apiKey, model.entry.model, context)
                       val apps = HandsApps.launchable(context)
-                      val system = HandsPrompt.system(opts.task, apps.map { it.label }.take(MAX_APPS_IN_PROMPT), opts.agentName, opts.language)
+                      val appLabelsForPrompt = if (opts.appHint.isNullOrBlank()) apps.map { it.label }.take(MAX_APPS_IN_PROMPT) else emptyList()
+                      val system = HandsPrompt.system(opts.task, appLabelsForPrompt, opts.agentName, opts.language)
                       val turns = mutableListOf<Turn>()
                       var lastResult: String? = null
                       var formatErrors = 0
@@ -2299,8 +2292,9 @@ jobs:
 
               private fun buildMessages(turns: List<Turn>, currentText: String, current: ByteArray?): List<LLMMessage> {
                   val out = mutableListOf<LLMMessage>()
-                  val withImage = turns.size - HISTORY_IMAGES
-                  turns.forEachIndexed { i, t ->
+                  val recentTurns = if (turns.size > 6) turns.takeLast(6) else turns
+                  val withImage = recentTurns.size - HISTORY_IMAGES
+                  recentTurns.forEachIndexed { i, t ->
                       val parts = mutableListOf<AgentContentPart>(AgentContentPart.Text(t.userText))
                       if (i >= withImage && t.image != null) parts += AgentContentPart.ImageData(t.image, "image/jpeg")
                       else parts += AgentContentPart.Text(HandsPrompt.OLDER_SCREEN)
@@ -2355,15 +2349,15 @@ jobs:
                   /** Longest side of a sent frame — PalmClaw's field-proven budget. */
                   private const val SHOT_MAX_SIDE = 1200
                   private const val JPEG_QUALITY = 85
-                  private const val HISTORY_IMAGES = 1
+                  private const val HISTORY_IMAGES = 0
                   private const val MODEL_TIMEOUT_MS = 90_000L
                   private const val TAKE_OVER_TIMEOUT_MS = 5 * 60_000L
                   private const val MAX_RUN_MS = 30 * 60_000L
-                  private const val TAP_SETTLE_MS = 180L
+                  private const val TAP_SETTLE_MS = 150L
                   private const val SWIPE_SETTLE_MS = 650L
                   private const val OPEN_APP_SETTLE_MS = 1000L
                   /** Breathing room between the actions of one batch (fast, human-paced). */
-                  private const val BATCH_GAP_MS = 150L
+                  private const val BATCH_GAP_MS = 140L
                   /** The ring shows this long before the finger lands, so the eye gets there first. */
                   private const val AIM_MS = 35L
                   private const val LONG_PRESS_MS = 900L
@@ -2504,7 +2498,7 @@ jobs:
               }
 
               @Test fun `batches are capped and single objects still parse`() {
-                  val many = (1..15).joinToString(",") { "{\"action_type\":\"wait\",\"seconds\":1}" }
+                  val many = (1..30).joinToString(",") { "{\"action_type\":\"wait\",\"seconds\":1}" }
                   val p = HandsAction.parse("Action: [$many]")
                   assertEquals(HandsAction.MAX_BATCH, p.actions.size)
                   val single = HandsAction.parse("Action: {\"action_type\":\"navigate_home\"}")
@@ -3596,10 +3590,10 @@ jobs:
                   val svc = svcOrThrow()
                   val rawTargets = args.positional.drop(2).flatMap { token ->
                       if (token.contains(":")) token.split(":").filter { it.isNotBlank() } else listOf(token)
-                  }.take(12)
+                  }.take(24)
                   if (rawTargets.isEmpty()) return NativeOffloadResult(2, "$TOOL tap batch: provide 1..12 targets (e.g. `tap batch 500,768` or `tap batch u12 u20 u20`)\n")
 
-                  val gapMs = (args.getLong("gap") ?: 150L).coerceIn(80L, 600L)
+                  val gapMs = (args.getLong("gap") ?: 140L).coerceIn(80L, 600L)
                   val dm = context.resources.displayMetrics
                   var screenW = dm.widthPixels.coerceAtLeast(1080)
                   var screenH = dm.heightPixels.coerceAtLeast(2400)
