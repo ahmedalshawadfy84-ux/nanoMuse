@@ -34,11 +34,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Apply Fast-Vision Architecture (hands-fast-vision.md)
+      - name: Apply Fast-Vision Architecture (Hands + Linux android-a11y-cli)
         run: |
           HANDS_MAIN="android/src/android/app/src/main/java/io/github/nanomuse/hands"
           HANDS_TEST="android/src/android/app/src/test/java/io/github/nanomuse/hands"
-          mkdir -p "$HANDS_MAIN" "$HANDS_TEST" nanomuse
+          OFFLOAD_DIR="android/src/android/app/src/main/java/com/openminis/app/sandbox/offload"
+          PERM_DIR="android/src/android/app/src/main/java/com/openminis/app/offload"
+          mkdir -p "$HANDS_MAIN" "$HANDS_TEST" "$OFFLOAD_DIR" "$PERM_DIR" nanomuse
 
           for search_dir in "." "nanoMuse-modified-files" "modified"; do
             if [ -d "$search_dir" ]; then
@@ -278,8 +280,13 @@ jobs:
                               if (r.model == null) add("no model that can see pictures")
                           }.joinToString(", ")
                           append("The screen is switched on but not usable yet ($missing). If a task needs it, say so in one line and give the link [Hands]($DEEP_LINK) — it opens the setting; do not try android-a11y-cli instead.")
+                      } else if (r.serviceOn) {
+                          append("The Hands sub-agent switch is off; use the direct Fast-Vision Linux CLI `android-a11y-cli` + `read_image` as your exclusive screen vision and control system:\n")
+                          append("- `android-a11y-cli open \"<app name>\"` — opens an app with sticky-session protection (never relaunches if already in foreground).\n")
+                          append("- `android-a11y-cli ui screenshot` — captures the live screen with the calibrated 0–999 yellow grid, tracked object IDs (`green_btn`, `c1..cN`, `u1..uN`), and `LAST_TAP` bullseye, saves it directly to `/var/minis/attachments/a11y/screen_latest.jpg` (and `/var/minis/shared/screen_latest.jpg`), and returns the full `fastVisionState` JSON (`ui_elements`, `green_button`, `tracked_objects`). Call `read_image` on `/var/minis/attachments/a11y/screen_latest.jpg` whenever you need to visually inspect the screen or solve a game board.\n")
+                          append("- `android-a11y-cli tap batch <target1> <target2> ...` — executes 1 to 12 taps at 150ms human speed with Touch Contract protection! Each target can be a 0–999 grid coordinate `gx,gy` (e.g. `500,768`), a tracked ID (`green_btn`, `c1`, `u1`), or an exact UI button label (`\"6\"`, `\"0\"`, `\"+\"`, `\"=\"`). Always batch obvious multi-step sequences (like calculator digits or unblocked game pieces with eyes 👀) in one `tap batch` call!")
                       } else {
-                          append("Operating the phone's screen is switched off (the default). If a task can only be done on the screen, say so in one line and give the link [Hands]($DEEP_LINK) so the user can switch it on; do not try android-a11y-cli instead, and do not pretend.")
+                          append("Operating the phone's screen is switched off (the default). If a task can only be done on the screen, say so in one line and give the link [Hands]($DEEP_LINK) so the user can switch it on.")
                       }
                   }
               }
@@ -2524,6 +2531,1857 @@ jobs:
               }
           }
           EOF_HANDS_TEST
+
+          cat << 'EOF_PERM_KT' > "$PERM_DIR/OffloadPermissionManager.kt"
+          package com.openminis.app.offload
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlinx.coroutines.withTimeoutOrNull
+          import kotlin.coroutines.resume
+
+          /**
+           * Manages offload permissions for privacy-sensitive agent tools.
+           * Three levels: BYPASS (auto-allow), ASK_ONCE (per-session), NOT_ALLOWED.
+           *
+           * Mirrors iOS OffloadPermissionManager behavior.
+           */
+          object OffloadPermissionManager {
+
+              enum class PermissionLevel {
+                  BYPASS,      // Always allowed
+                  ASK_ONCE,    // Ask once per session
+                  NOT_ALLOWED, // Always denied
+              }
+
+              data class PermissionRequest(
+                  val toolName: String,
+                  val toolTitle: String,
+                  val description: String,
+                  val sessionId: String,
+              )
+
+              enum class PermissionCategory(val displayName: String) {
+                  PRIVACY("Privacy"),
+                  MEDIA("Media"),
+                  SYSTEM("System"),
+                  // T330: privileged automation CLIs (Shizuku binder / Accessibility
+                  // service). These run via the offload bridge as shell tools, not as
+                  // named LLM tool calls, so the gate happens inside the
+                  // NativeOffloadHandler entry point rather than ChatViewModel.
+                  INTEGRATIONS("Integrations"),
+              }
+
+              data class ToolPermissionInfo(
+                  val toolName: String,
+                  val displayName: String,
+                  val category: PermissionCategory,
+                  val defaultLevel: PermissionLevel,
+                  /**
+                   * Mirrors iOS `OffloadCommandInfo.showInSettings`. When false the tool
+                   * is registered (so the dialog/check pipeline still recognises its
+                   * name) but hidden from the Permissions settings page — Media + System
+                   * tools carry no personal data and have no reason to clutter the UI.
+                   */
+                  val showInSettings: Boolean = true,
+              )
+
+              /**
+               * Registry of all tools and their permission categories. Defaults are
+               * BYPASS across the board to mirror iOS — the user opted into running an
+               * agent app, so background access is permitted unless they explicitly
+               * downgrade an entry to ASK_ONCE / NOT_ALLOWED. Tools omitted from this
+               * registry (e.g. the former `open_url` and `model_use` entries) fall
+               * through to BYPASS via [getLevel]'s unknown-tool branch — no separate
+               * "always permit" carve-out needed.
+               */
+              val toolRegistry: List<ToolPermissionInfo> = listOf(
+                  // Privacy — user-configurable, visible in Settings.
+                  ToolPermissionInfo("calendar", "Calendar", PermissionCategory.PRIVACY, PermissionLevel.BYPASS),
+                  ToolPermissionInfo("location", "Location", PermissionCategory.PRIVACY, PermissionLevel.BYPASS),
+                  ToolPermissionInfo("clipboard", "Clipboard", PermissionCategory.PRIVACY, PermissionLevel.BYPASS),
+                  ToolPermissionInfo("contacts", "Contacts", PermissionCategory.PRIVACY, PermissionLevel.BYPASS),
+                  ToolPermissionInfo("photos", "Photos", PermissionCategory.PRIVACY, PermissionLevel.BYPASS),
+                  // Media — no personal data, hidden from Settings.
+                  ToolPermissionInfo("speak", "Text-to-Speech", PermissionCategory.MEDIA, PermissionLevel.BYPASS, showInSettings = false),
+                  ToolPermissionInfo("media_player", "Media Player", PermissionCategory.MEDIA, PermissionLevel.BYPASS, showInSettings = false),
+                  ToolPermissionInfo("speech_recognition", "Speech Recognition", PermissionCategory.MEDIA, PermissionLevel.BYPASS, showInSettings = false),
+                  // System — no personal data, hidden from Settings.
+                  ToolPermissionInfo("alarm", "Alarms & Timers", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
+                  ToolPermissionInfo("weather", "Weather", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
+                  ToolPermissionInfo("notification", "Notifications", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
+                  ToolPermissionInfo("device_info", "Device Info", PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false),
+                  // T330: integrations — opt-in by default. These tools can drive
+                  // other apps and read on-screen content, so the safer posture is
+                  // NOT_ALLOWED until the user picks otherwise even when the
+                  // underlying system layer (Shizuku binder / Accessibility service)
+                  // is already authorized.
+                  ToolPermissionInfo("a11y_cli", "android-a11y-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.BYPASS),
+                  ToolPermissionInfo("shizuku_cli", "android-shizuku-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
+              )
+
+              /** Stable session-id used by NativeOffloadHandlers when calling
+               *  [checkPermission] from the offload IPC thread. The shell-CLI gate
+               *  (T330) lives outside ChatViewModel.executeTool, so there's no
+               *  per-chat-session id available to scope ASK_ONCE grants. We use
+               *  one process-lifetime grant slot instead — the user "Always Allow"
+               *  upgrades naturally to BYPASS via [respondToRequest]. */
+              const val OFFLOAD_GLOBAL_SESSION_ID = "offload-global"
+
+              private lateinit var prefs: SharedPreferences
+
+              /** Session-scoped grants for ASK_ONCE tools. Populated by the
+               *  "Allow in this session" dialog response. Cleared when the
+               *  hosting session ends (or process death — see
+               *  OFFLOAD_GLOBAL_SESSION_ID for offload-CLI-backed tools, which
+               *  share one process-lifetime slot). */
+              private val sessionGrants = mutableMapOf<String, MutableSet<String>>() // sessionId -> set of toolNames
+
+              /** T338: session-scoped denials. Populated by the "Deny in this
+               *  session" dialog response. Once a tool is in here for a given
+               *  session, [checkPermission] returns false without re-prompting
+               *  — prevents the agent from spamming the user with the same
+               *  request after they already said no. Cleared with
+               *  [clearSessionGrants]. */
+              private val sessionDenials = mutableMapOf<String, MutableSet<String>>() // sessionId -> set of toolNames
+
+              /** Active permission request waiting for user response. */
+              private val _pendingRequest = MutableStateFlow<PermissionRequest?>(null)
+              val pendingRequest: StateFlow<PermissionRequest?> = _pendingRequest.asStateFlow()
+
+              private var pendingContinuation: kotlin.coroutines.Continuation<Response>? = null
+
+              // ── Android system runtime permission request (for location etc.) ──────────
+
+              /** Result of a runtime permission or settings-gate flow. */
+              enum class AndroidPermissionResult { GRANTED, DENIED, TIMEOUT }
+
+              /** Timeout for a single system permission dialog round-trip. */
+              const val SYSTEM_DIALOG_TIMEOUT_MS: Long = 120_000L
+
+              /** Timeout for the "bounce the user to a settings page" flow. */
+              const val SETTINGS_GATE_TIMEOUT_MS: Long = 120_000L
+
+              data class AndroidPermissionRequest(val permissions: List<String>)
+
+              private val _pendingAndroidPermission = MutableStateFlow<AndroidPermissionRequest?>(null)
+              val pendingAndroidPermission: StateFlow<AndroidPermissionRequest?> = _pendingAndroidPermission.asStateFlow()
+
+              private var androidPermissionContinuation: kotlin.coroutines.Continuation<AndroidPermissionResult>? = null
+
+              /**
+               * Ask the UI layer to drive the system runtime-permission flow for the
+               * given permissions. The UI is responsible for:
+               *
+               *  - Detecting whether the permission has already been permanently denied
+               *    (so the system dialog would be a no-op). If so, responding with
+               *    [AndroidPermissionResult.DENIED] so the caller can fall back to the
+               *    in-app "go to settings" flow via [requestSettingsGate].
+               *  - Otherwise launching the `RequestMultiplePermissions` contract and
+               *    returning the result.
+               *
+               * The call is suspended until the UI responds or [SYSTEM_DIALOG_TIMEOUT_MS]
+               * elapses.
+               */
+              suspend fun requestAndroidPermission(permissions: List<String>): AndroidPermissionResult {
+                  val timed = withTimeoutOrNull(SYSTEM_DIALOG_TIMEOUT_MS) {
+                      suspendCancellableCoroutine<AndroidPermissionResult> { cont ->
+                          androidPermissionContinuation = cont
+                          _pendingAndroidPermission.value = AndroidPermissionRequest(permissions)
+                          cont.invokeOnCancellation {
+                              _pendingAndroidPermission.value = null
+                              androidPermissionContinuation = null
+                          }
+                      }
+                  }
+                  if (timed == null) {
+                      // Timed out — clear the pending request so the UI doesn't fire a
+                      // stale permission dialog later.
+                      _pendingAndroidPermission.value = null
+                      androidPermissionContinuation = null
+                      return AndroidPermissionResult.TIMEOUT
+                  }
+                  return timed
+              }
+
+              /** Called from UI after the system permission dialog returns. */
+              fun respondToAndroidPermission(result: AndroidPermissionResult) {
+                  _pendingAndroidPermission.value = null
+                  androidPermissionContinuation?.resume(result)
+                  androidPermissionContinuation = null
+              }
+
+              /** Overload kept for callers that only have a granted/denied bool. */
+              fun respondToAndroidPermission(granted: Boolean) =
+                  respondToAndroidPermission(
+                      if (granted) AndroidPermissionResult.GRANTED else AndroidPermissionResult.DENIED
+                  )
+
+              // ── In-app "go to settings" gate ───────────────────────────────────────────
+
+              /**
+               * Describes a gate we can't resolve with the standard permission dialog:
+               * either the user has already permanently denied the runtime permission,
+               * or the capability (e.g. Notification Access) requires a trip to a
+               * system settings page.
+               */
+              data class SettingsGateRequest(
+                  /** Stable id for the gate (e.g. "POST_NOTIFICATIONS" or "notification_access"). */
+                  val id: String,
+                  /** Title shown in the in-app AlertDialog. */
+                  val title: String,
+                  /** Body shown in the in-app AlertDialog. */
+                  val message: String,
+                  /** Intent action used to open the appropriate settings page. */
+                  val settingsAction: String,
+                  /**
+                   * Set when the target settings page is "Application details" and the
+                   * Intent must include a `package:<pkg>` data URI.
+                   */
+                  val requiresPackageUri: Boolean,
+                  /** "Allow" button label for the in-app dialog. */
+                  val positiveLabel: String = "Open Settings",
+                  /** "Cancel" button label for the in-app dialog. */
+                  val negativeLabel: String = "Cancel",
+              )
+
+              /** What the UI actor decided after the dialog closed. */
+              enum class SettingsGateDecision { OPEN, CANCEL }
+
+              private val _pendingSettingsGate = MutableStateFlow<SettingsGateRequest?>(null)
+              val pendingSettingsGate: StateFlow<SettingsGateRequest?> = _pendingSettingsGate.asStateFlow()
+
+              private var settingsGateContinuation: kotlin.coroutines.Continuation<SettingsGateDecision>? = null
+
+              /**
+               * Show an in-app dialog explaining why a settings trip is needed, then
+               * (if the user accepts) wait up to [SETTINGS_GATE_TIMEOUT_MS] polling
+               * [check] for success.
+               *
+               * Returns:
+               *  - [AndroidPermissionResult.GRANTED] if [check] succeeds within the
+               *    polling window.
+               *  - [AndroidPermissionResult.DENIED] if the user cancels the dialog.
+               *  - [AndroidPermissionResult.TIMEOUT] if the user accepts but doesn't
+               *    complete the grant within the window.
+               */
+              suspend fun requestSettingsGate(
+                  request: SettingsGateRequest,
+                  check: () -> Boolean,
+              ): AndroidPermissionResult {
+                  val decision = suspendCancellableCoroutine<SettingsGateDecision> { cont ->
+                      settingsGateContinuation = cont
+                      _pendingSettingsGate.value = request
+                      cont.invokeOnCancellation {
+                          _pendingSettingsGate.value = null
+                          settingsGateContinuation = null
+                      }
+                  }
+                  if (decision == SettingsGateDecision.CANCEL) return AndroidPermissionResult.DENIED
+
+                  val granted = withTimeoutOrNull(SETTINGS_GATE_TIMEOUT_MS) {
+                      while (true) {
+                          if (check()) return@withTimeoutOrNull true
+                          delay(500L)
+                      }
+                      @Suppress("UNREACHABLE_CODE") false
+                  }
+                  return when (granted) {
+                      true -> AndroidPermissionResult.GRANTED
+                      else -> AndroidPermissionResult.TIMEOUT
+                  }
+              }
+
+              /**
+               * Poll [check] every [intervalMs] for up to [timeoutMs] after a DENIED
+               * result from [requestAndroidPermission]. Catches the "grant propagation
+               * race" — the system dialog returned before the PackageManager fully
+               * committed the grant, or the user was still mid-tap when DENIED fired.
+               */
+              suspend fun pollForPermissionGrant(
+                  check: () -> Boolean,
+                  timeoutMs: Long = 5_000L,
+                  intervalMs: Long = 500L,
+              ): Boolean {
+                  val granted = withTimeoutOrNull(timeoutMs) {
+                      while (true) {
+                          if (check()) return@withTimeoutOrNull true
+                          delay(intervalMs)
+                      }
+                      @Suppress("UNREACHABLE_CODE") false
+                  }
+                  return granted == true
+              }
+
+              /** Called from UI after the in-app "go to settings" dialog closes. */
+              fun respondToSettingsGate(decision: SettingsGateDecision) {
+                  _pendingSettingsGate.value = null
+                  settingsGateContinuation?.resume(decision)
+                  settingsGateContinuation = null
+              }
+
+              /**
+               * Android's `shouldShowRequestPermissionRationale` returns false in two
+               * cases: (a) the app has never asked, and (b) the user permanently
+               * denied. We track (a) ourselves so the UI can distinguish them.
+               */
+              fun hasAskedForPermission(context: Context, permission: String): Boolean {
+                  val p = context.getSharedPreferences("offload_permissions_asked", Context.MODE_PRIVATE)
+                  return p.getBoolean(permission, false)
+              }
+
+              fun markPermissionAsked(context: Context, permission: String) {
+                  context.getSharedPreferences("offload_permissions_asked", Context.MODE_PRIVATE)
+                      .edit().putBoolean(permission, true).apply()
+              }
+
+              fun init(context: Context) {
+                  prefs = context.getSharedPreferences("offload_permissions", Context.MODE_PRIVATE)
+              }
+
+              fun getLevel(toolName: String): PermissionLevel {
+                  val info = toolRegistry.find { it.toolName == toolName }
+                      ?: return PermissionLevel.BYPASS // Unknown tools are bypassed
+
+                  val stored = prefs.getString("level_$toolName", null)
+                  return if (stored != null) {
+                      try { PermissionLevel.valueOf(stored) } catch (_: Exception) { info.defaultLevel }
+                  } else {
+                      info.defaultLevel
+                  }
+              }
+
+              fun setLevel(toolName: String, level: PermissionLevel) {
+                  prefs.edit().putString("level_$toolName", level.name).apply()
+              }
+
+              fun resetAll() {
+                  val editor = prefs.edit()
+                  for (tool in toolRegistry) {
+                      editor.remove("level_${tool.toolName}")
+                  }
+                  editor.apply()
+              }
+
+              /**
+               * T338: dialog response shape. Replaces the older
+               * `(allowed: Boolean, alwaysAllow: Boolean)` pair, which encoded
+               * "Always Allow" as a persistent BYPASS upgrade. The new model is
+               * strictly session-scoped — the user goes to Settings → Permissions
+               * to make a permanent change.
+               *
+               *   ALLOW_SESSION  — grant for the rest of this session, no more
+               *                    prompts for this tool until session ends.
+               *   ALLOW_ONCE     — grant just this call; next call re-prompts.
+               *   DENY_SESSION   — deny + remember the deny so the agent can't
+               *                    keep nagging. Cleared with the session.
+               */
+              enum class Response { ALLOW_SESSION, ALLOW_ONCE, DENY_SESSION }
+
+              /**
+               * Check permission for a tool in the given session.
+               * For ASK_ONCE, suspends until user responds via the dialog.
+               * Returns true if allowed.
+               */
+              suspend fun checkPermission(toolName: String, toolTitle: String, sessionId: String): Boolean {
+                  val level = getLevel(toolName)
+                  return when (level) {
+                      PermissionLevel.BYPASS -> true
+                      PermissionLevel.NOT_ALLOWED -> false
+                      PermissionLevel.ASK_ONCE -> {
+                          // T338: a prior "Deny in this session" short-circuits
+                          // before any grants check or dialog so the agent can't
+                          // spam the user.
+                          val denials = sessionDenials.getOrPut(sessionId) { mutableSetOf() }
+                          if (toolName in denials) return false
+
+                          val grants = sessionGrants.getOrPut(sessionId) { mutableSetOf() }
+                          if (toolName in grants) return true
+
+                          // Show dialog and wait for response.
+                          val info = toolRegistry.find { it.toolName == toolName }
+                          val response = suspendCancellableCoroutine<Response> { cont ->
+                              pendingContinuation = cont
+                              _pendingRequest.value = PermissionRequest(
+                                  toolName = toolName,
+                                  toolTitle = toolTitle,
+                                  description = "Allow ${info?.displayName ?: toolName} access?",
+                                  sessionId = sessionId,
+                              )
+                              cont.invokeOnCancellation {
+                                  _pendingRequest.value = null
+                                  pendingContinuation = null
+                              }
+                          }
+
+                          when (response) {
+                              Response.ALLOW_SESSION -> {
+                                  grants.add(toolName)
+                                  true
+                              }
+                              Response.ALLOW_ONCE -> true  // no caching; next call re-prompts
+                              Response.DENY_SESSION -> {
+                                  denials.add(toolName)
+                                  false
+                              }
+                          }
+                      }
+                  }
+              }
+
+              /** Called from UI when user responds to the permission dialog. */
+              fun respondToRequest(response: Response) {
+                  _pendingRequest.value = null
+                  pendingContinuation?.resume(response)
+                  pendingContinuation = null
+              }
+
+              /** Clear session grants AND denials (call when a session ends). */
+              fun clearSessionGrants(sessionId: String) {
+                  sessionGrants.remove(sessionId)
+                  sessionDenials.remove(sessionId)
+              }
+          }
+          EOF_PERM_KT
+
+          cat << 'EOF_A11Y_KT' > "$OFFLOAD_DIR/AccessibilityOffloadHandler.kt"
+          package com.openminis.app.sandbox.offload
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import com.openminis.app.sandbox.PRootKernel
+          import io.github.nanomuse.hands.HandsAction
+          import io.github.nanomuse.hands.HandsApps
+          import io.github.nanomuse.hands.ScreenWords
+          import android.os.Build
+          import android.view.Display
+          import android.view.accessibility.AccessibilityNodeInfo
+          import com.openminis.app.accessibility.AccessibilityRecoveryManager
+          import com.openminis.app.accessibility.MinisAccessibilityService
+          import com.openminis.app.accessibility.NodeRegistry
+          import com.openminis.app.accessibility.RestrictedSettingsManager
+          import com.openminis.app.logging.AppLogger
+          import com.openminis.app.sandbox.NativeOffloadHandler
+          import com.openminis.app.sandbox.NativeOffloadRequest
+          import com.openminis.app.sandbox.NativeOffloadResult
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /**
+           * `android-a11y-cli` — UI-layer automation surface backed by
+           * [MinisAccessibilityService]. Mirrors the design doc
+           * `docs/.../android-accessibility-cli-design.md`.
+           *
+           * Output envelope `{ ok, data }` / `{ ok:false, error:{code,message} }`
+           * matches the rest of `android-*` so `--quiet` strips it cleanly.
+           */
+          class AccessibilityOffloadHandler(private val context: Context) : NativeOffloadHandler {
+
+              companion object {
+                  private const val TAG = "A11yOffload"
+                  private const val TOOL = "android-a11y-cli"
+
+                  private const val TOP_HELP = """android-a11y-cli — UI-layer automation via Android AccessibilityService.
+
+          Usage:
+            android-a11y-cli <group> <subcommand> [flags]
+
+          Groups:
+            ui        dump | find | info | node | screenshot
+            tap       node | xy | text | id
+            input     text | clear | key
+            scroll    node | xy | to-text
+            gesture   swipe | pinch | path
+            wait      appear | disappear | stable | activity
+            event     watch | once
+            notify    watch | once
+            dialog    detect | dismiss
+            extract   text | list | form
+            service   status | ping
+
+          Output: JSON envelope { ok, data | error: { code, message } }.
+          Use --compact to emit on a single line; --quiet to strip the envelope.
+
+          First-run: enable "nanoMuse" under Settings → Accessibility, then `service ping`.
+          """
+                  private const val SERVICE_HELP = "service status | ping\n"
+                  private const val UI_HELP = """ui dump | find | info | node | screenshot
+
+            ui screenshot                Capture a system-wide screenshot via
+                                         AccessibilityService.takeScreenshot (API 30+).
+              --scale <float>            Scale factor applied to the captured bitmap
+                                         (default 0.5; e.g. 1.0 = native, 0.25 = quarter).
+              --display <int>            Display id to capture (default 0 = default).
+              --inline | -b              Return base64 PNG inline instead of writing
+                                         to a file. Otherwise the PNG is written to
+                                         <externalFilesDir>/a11y_screenshots/<ts>.png
+                                         and the path is returned.
+          """
+                  private const val TAP_HELP = "tap batch <t1> <t2> ... [--gap 150] | tap node <id> | tap xy <x> <y> | tap text <s> | tap id <res>\n"
+                  @Volatile private var lastA11yTapPx: Pair<Int, Int>? = null
+                  private const val INPUT_HELP = "input text <s> [--node id] [--clear|--append] | input clear | input key BACK|HOME|RECENTS|NOTIFICATIONS\n"
+                  private const val SCROLL_HELP = "scroll node <id> [--direction up|down|left|right] [--times n] | scroll xy <x> <y> | scroll to-text <s>\n"
+                  private const val GESTURE_HELP = "gesture swipe <x1> <y1> <x2> <y2> | gesture pinch <cx> <cy> [--scale f] | gesture path \"x,y:x,y\"\n"
+                  private const val WAIT_HELP = "wait appear | disappear | stable | activity\n"
+                  private const val EVENT_HELP = "event watch [--type T] [--package P] [--duration ms] | event once [--type T] [--timeout ms]\n"
+                  private const val NOTIFY_HELP = "notify watch [--package P] [--text-contains S] [--duration ms] | notify once [--timeout ms]\n"
+                  private const val DIALOG_HELP = "dialog detect | dialog dismiss [--confirm|--deny|--button TEXT]\n"
+                  private const val EXTRACT_HELP = "extract text | list [--auto-scroll] | form\n"
+              }
+
+              override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+                  val args = OffloadArgs(
+                      request.argv.drop(1),
+                      booleanFlags = setOf(
+                          "help", "h", "long", "double", "clear", "append",
+                          "annotate", "compact", "inline", "b",
+                          "clickable", "editable", "scrollable", "checked", "enabled",
+                          "visible-only", "auto-scroll", "auto-dismiss", "auto-confirm",
+                          "confirm", "deny", "children", "ancestors",
+                      ),
+                  )
+                  if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
+                      return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
+                  }
+                  val sub = args.positional[0]
+                  io.github.nanomuse.status.KeepAwake.a11yTouched() // nanoMuse: the screen stays on while this runs
+                  // T330: tri-state agent gate via OffloadPermissionManager. `service`
+                  // and `--version` are diagnostic and pass through so the agent (or
+                  // a curious developer) can still verify the service runs even when
+                  // the agent surface is blocked.
+                  if (sub != "service" && sub != "--version") {
+                      if (!OffloadGate.allow("a11y_cli", "android-a11y-cli", request)) {
+                          return err(
+                              args,
+                              "PERMISSION_DENIED",
+                              "Agent is not allowed to use android-a11y-cli. Open Settings → Permissions → Integrations to change.",
+                          )
+                      }
+                  }
+                  // [T-android-a11y-force-stop-recovery] A force-stop (system Settings'
+                  // "Force stop", or an OEM "clear" button) makes the framework strip our
+                  // component out of Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES. It
+                  // never self-heals, so without this every subsequent a11y call just
+                  // returns SERVICE_NOT_RUNNING and the user has no idea the grant is the
+                  // problem. Detect it here — the single point every real operation
+                  // passes through — and offer a repair (one-tap via Shizuku when
+                  // available, otherwise a trip to Settings).
+                  //
+                  // `service` / `--version` are exempt for the same reason they bypass
+                  // the gate above: they are how you DIAGNOSE this state, and prompting
+                  // from `service status` would be circular.
+                  //
+                  // runBlocking matches the established pattern for permission gates in
+                  // the sibling handlers (Calendar / Contacts / BrowserUse) — offload
+                  // handlers are invoked off the main thread on a sandbox worker, and
+                  // `handle` is not a suspend fun. The prompt self-cancels after
+                  // AccessibilityRecoveryManager.PROMPT_TIMEOUT_MS so this can never
+                  // block the worker indefinitely.
+                  if (sub != "service" && sub != "--version") {
+                      val usable = kotlinx.coroutines.runBlocking {
+                          AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
+                      }
+                      if (!usable) {
+                          // [T-android-restricted-settings] Distinguish the two reasons
+                          // the grant can be missing. If the OS has flagged this install
+                          // (sideloaded from a downloaded APK), telling the user to
+                          // "re-enable it under Settings → Accessibility" sends them to a
+                          // toggle that is greyed out and cannot be moved — the actual
+                          // blocker is the restricted-settings gate, so name it.
+                          val restricted = RestrictedSettingsManager.isRestricted(context)
+                          return err(
+                              args,
+                              "SERVICE_NOT_RUNNING",
+                              if (restricted) {
+                                  "Android is blocking the accessibility toggle for this install " +
+                                      "(\"Restricted setting\" — applies to apps installed from a " +
+                                      "downloaded APK). Allow it via App info → ⋮ → Allow restricted " +
+                                      "settings, then enable nanoMuse under Settings → Accessibility. " +
+                                      "Settings → Permissions → System Permissions has a one-tap fix " +
+                                      "when Shizuku is available."
+                              } else {
+                                  "Accessibility permission was revoked (this happens after a force-stop). " +
+                                      "Re-enable nanoMuse under Settings → Accessibility, or use Settings → " +
+                                      "Permissions → Integrations to repair it with Shizuku."
+                              },
+                              exit = 77,
+                          )
+                      }
+                  }
+                  // [T-bg-overlay phase 2 fix] Surface a11y sub-action progress to
+                  // SessionActivityTracker.currentToolStatus so the background
+                  // overlay capsule + FGS notification show what the agent is
+                  // actually doing — "tap by-text Login" instead of the static
+                  // "Running: a11y_cli". Computed before dispatch so even fast
+                  // sub-commands (status / ping) get a one-line update before they
+                  // return. Does NOT touch the per-message tool name / running
+                  // flag — those stay owned by ChatViewModel so the overlay's
+                  // tool-icon and indeterminate progress are not affected.
+                  com.openminis.app.service.SessionActivityTracker.updateToolStatus(
+                      statusForSubAction(sub, args.positional.getOrNull(1), args),
+                  )
+                  return try {
+                      when (sub) {
+                          "ui"        -> uiSub(args, request.sessionId)
+                          "open"      -> openAppSub(args)
+                          "tap"       -> tapSub(args)
+                          "input"     -> inputSub(args)
+                          "scroll"    -> scrollSub(args)
+                          "gesture"   -> gestureSub(args)
+                          "wait"      -> waitSub(args)
+                          "event"     -> eventSub(args)
+                          "notify"    -> notifySub(args)
+                          "dialog"    -> dialogSub(args)
+                          "extract"   -> extractSub(args)
+                          "service"   -> serviceSub(args)
+                          "--version" -> NativeOffloadResult(0, "android-a11y-cli 0.1\n")
+                          else        -> NativeOffloadResult(2, "$TOOL: unknown subcommand '$sub'\n$TOP_HELP")
+                      }
+                  } catch (e: NotRunning) {
+                      err(args, "SERVICE_NOT_RUNNING",
+                          e.message ?: "Accessibility service is not running. Enable nanoMuse under Settings → Accessibility.",
+                          exit = 77)
+                  } catch (e: Throwable) {
+                      AppLogger.warning(TAG, "uncaught: ${e.javaClass.simpleName} ${e.message}")
+                      err(args, "INTERNAL", "${e.javaClass.simpleName}: ${e.message ?: ""}")
+                  }
+              }
+
+              // ── service ──────────────────────────────────────────────────────────
+
+              private fun serviceSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null -> NativeOffloadResult(2, SERVICE_HELP)
+                      "status" -> {
+                          val svc = MinisAccessibilityService.getInstance()
+                          val data = JSONObject()
+                              .put("running", svc != null)
+                              .put("serviceName", MinisAccessibilityService.SERVICE_ID)
+                              .put("capabilities", JSONArray().apply {
+                                  put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
+                              })
+                              .put("androidVersion", android.os.Build.VERSION.SDK_INT)
+                              // [T-android-restricted-settings] `service status` is the
+                              // documented way to diagnose why the service won't start,
+                              // so report the OS-level block explicitly — otherwise the
+                              // only visible fact is running=false, which looks
+                              // identical to "the user never enabled it".
+                              .put("restrictedSettings", RestrictedSettingsManager.isRestricted(context))
+                          ok(args, data)
+                      }
+                      "ping" -> {
+                          if (MinisAccessibilityService.getInstance() != null)
+                              NativeOffloadResult(0, "✓ Accessibility service is running\n")
+                          else if (RestrictedSettingsManager.isRestricted(context))
+                              NativeOffloadResult(
+                                  77,
+                                  "✗ Accessibility service is not running — Android has flagged this " +
+                                      "install as \"Restricted setting\" and the toggle is greyed out. " +
+                                      "Allow it via App info → ⋮ → Allow restricted settings first.\n",
+                              )
+                          else
+                              NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → nanoMuse to enable\n")
+                      }
+                      else -> NativeOffloadResult(2, "$TOOL service: unknown action\n$SERVICE_HELP")
+                  }
+              }
+
+              // ── ui ───────────────────────────────────────────────────────────────
+
+              private fun uiSub(args: OffloadArgs, sessionId: String? = null): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null         -> NativeOffloadResult(2, UI_HELP)
+                      "dump"       -> uiDump(args)
+                      "find"       -> uiFind(args)
+                      "info"       -> uiInfo(args)
+                      "node"       -> uiNode(args)
+                      "screenshot" -> uiScreenshot(args, sessionId)
+                      else         -> NativeOffloadResult(2, "$TOOL ui: unknown action\n$UI_HELP")
+                  }
+              }
+
+              /** Sticky-session app launcher for `android-a11y-cli open "<app name>"`. */
+              private fun openAppSub(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val appName = args.positional.drop(1).joinToString(" ").trim()
+                  if (appName.isEmpty()) return NativeOffloadResult(2, "$TOOL open: missing <app_name>\n")
+                  val app = HandsApps.resolve(context, appName)
+                      ?: return err(args, "APP_NOT_FOUND", "no installed app matches '$appName'")
+                  val (fgPkg, _) = svc.foregroundPackage()
+                  val alreadyInApp = fgPkg != null && (
+                      fgPkg.equals(app.packageName, ignoreCase = true) ||
+                          fgPkg.contains("clone", ignoreCase = true) ||
+                          fgPkg.contains("dual", ignoreCase = true)
+                      )
+                  if (alreadyInApp) {
+                      return ok(args, JSONObject().put("app", app.label).put("package", app.packageName).put("sticky", true).put("message", "already in foreground; stayed on current screen"))
+                  }
+                  val opened = HandsApps.open(context, app)
+                  if (opened) Thread.sleep(800)
+                  return if (opened) ok(args, JSONObject().put("app", app.label).put("package", app.packageName).put("sticky", false).put("message", "opened ${app.label}"))
+                  else err(args, "OPEN_FAILED", "could not launch ${app.label}")
+              }
+
+              private fun uiDump(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val maxDepth = args.getInt("depth") ?: 10
+                  val compact = args.hasFlag("compact")
+                  val visibleOnly = args.getBool("visible-only") ?: true
+                  val arr = JSONArray()
+                  for (root in svc.rootNodes()) {
+                      walkNode(svc.nodeRegistry, root, 0, maxDepth, visibleOnly, compact, arr)
+                  }
+                  return ok(args, JSONObject().put("count", arr.length()).put("nodes", arr))
+              }
+
+              private fun walkNode(
+                  registry: NodeRegistry, node: AccessibilityNodeInfo?,
+                  depth: Int, maxDepth: Int, visibleOnly: Boolean, compact: Boolean, out: JSONArray,
+              ) {
+                  if (node == null || depth > maxDepth) return
+                  if (!visibleOnly || node.isVisibleToUser) out.put(nodeToJson(registry, node, depth, compact))
+                  for (i in 0 until node.childCount) {
+                      walkNode(registry, node.getChild(i), depth + 1, maxDepth, visibleOnly, compact, out)
+                  }
+              }
+
+              private fun nodeToJson(registry: NodeRegistry, n: AccessibilityNodeInfo, depth: Int, compact: Boolean): JSONObject {
+                  val id = registry.put(n)
+                  val rect = Rect(); n.getBoundsInScreen(rect)
+                  val text = n.text?.toString()
+                  val desc = n.contentDescription?.toString()
+                  val obj = JSONObject().put("nodeId", id)
+                  if (compact) {
+                      if (!text.isNullOrEmpty()) obj.put("text", text)
+                      if (!desc.isNullOrEmpty()) obj.put("contentDesc", desc)
+                      obj.put("clickable", n.isClickable)
+                      obj.put("center", JSONObject().put("x", rect.centerX()).put("y", rect.centerY()))
+                  } else {
+                      obj.put("className", n.className?.toString() ?: "")
+                      obj.put("text", text ?: "")
+                      obj.put("contentDesc", desc ?: "")
+                      obj.put("resourceId", n.viewIdResourceName ?: "")
+                      obj.put("packageName", n.packageName?.toString() ?: "")
+                      obj.put("bounds", JSONObject()
+                          .put("left", rect.left).put("top", rect.top)
+                          .put("right", rect.right).put("bottom", rect.bottom))
+                      obj.put("center", JSONObject().put("x", rect.centerX()).put("y", rect.centerY()))
+                      obj.put("clickable", n.isClickable)
+                      obj.put("longClickable", n.isLongClickable)
+                      obj.put("scrollable", n.isScrollable)
+                      obj.put("editable", n.isEditable)
+                      obj.put("checkable", n.isCheckable)
+                      obj.put("checked", n.isChecked)
+                      obj.put("focusable", n.isFocusable)
+                      obj.put("focused", n.isFocused)
+                      obj.put("selected", n.isSelected)
+                      obj.put("enabled", n.isEnabled)
+                      obj.put("visible", n.isVisibleToUser)
+                      obj.put("depth", depth)
+                      obj.put("childCount", n.childCount)
+                  }
+                  return obj
+              }
+
+              private fun uiFind(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val limit = args.getInt("limit") ?: 50
+                  val depth = args.getInt("depth") ?: 30
+                  val matches = ArrayList<AccessibilityNodeInfo>()
+                  for (root in svc.rootNodes()) {
+                      findMatching(root, args, depth, 0, matches, limit)
+                      if (matches.size >= limit) break
+                  }
+                  val index = args.getInt("index")
+                  val arr = JSONArray()
+                  if (index != null) {
+                      matches.getOrNull(index)?.let { arr.put(nodeToJson(svc.nodeRegistry, it, 0, compact = false)) }
+                  } else {
+                      for (m in matches) arr.put(nodeToJson(svc.nodeRegistry, m, 0, compact = false))
+                  }
+                  return ok(args, JSONObject().put("count", arr.length()).put("data", arr))
+              }
+
+              private fun findMatching(
+                  node: AccessibilityNodeInfo?, args: OffloadArgs,
+                  maxDepth: Int, depth: Int,
+                  out: MutableList<AccessibilityNodeInfo>, limit: Int,
+              ) {
+                  if (node == null || depth > maxDepth || out.size >= limit) return
+                  if (matchesPredicate(node, args)) out.add(node)
+                  for (i in 0 until node.childCount) {
+                      findMatching(node.getChild(i), args, maxDepth, depth + 1, out, limit)
+                  }
+              }
+
+              private fun matchesPredicate(n: AccessibilityNodeInfo, args: OffloadArgs): Boolean {
+                  args.get("text")?.let { if (n.text?.toString() != it) return false }
+                  args.get("text-contains")?.let { if (n.text?.toString()?.contains(it) != true) return false }
+                  args.get("desc")?.let { if (n.contentDescription?.toString() != it) return false }
+                  args.get("desc-contains")?.let { if (n.contentDescription?.toString()?.contains(it) != true) return false }
+                  args.get("id")?.let { if (n.viewIdResourceName != it) return false }
+                  args.get("class")?.let { if (n.className?.toString() != it) return false }
+                  args.get("package")?.let { if (n.packageName?.toString() != it) return false }
+                  if (args.hasFlag("clickable") && !n.isClickable) return false
+                  if (args.hasFlag("editable") && !n.isEditable) return false
+                  if (args.hasFlag("scrollable") && !n.isScrollable) return false
+                  if (args.hasFlag("checked") && !n.isChecked) return false
+                  if (args.hasFlag("enabled") && !n.isEnabled) return false
+                  return true
+              }
+
+              private fun uiInfo(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val (pkg, cls) = svc.foregroundPackage()
+                  val windows = svc.windowInfos()
+                  val winArr = JSONArray()
+                  for (w in windows) {
+                      winArr.put(JSONObject().apply { for ((k, v) in w) put(k, v ?: JSONObject.NULL) })
+                  }
+                  return ok(args, JSONObject()
+                      .put("packageName", pkg ?: "")
+                      .put("activityName", cls ?: "")
+                      .put("windowCount", windows.size)
+                      .put("windows", winArr))
+              }
+
+              private fun uiNode(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL ui node: missing <nodeId>\n")
+                  val n = svc.nodeRegistry.get(nodeId)
+                      ?: return err(args, "NODE_NOT_FOUND", "no live node with id=$nodeId; re-run `ui dump`")
+                  val data = nodeToJson(svc.nodeRegistry, n, 0, compact = false)
+                  if (args.hasFlag("children")) {
+                      val ch = JSONArray()
+                      for (i in 0 until n.childCount) {
+                          n.getChild(i)?.let { ch.put(nodeToJson(svc.nodeRegistry, it, 1, compact = false)) }
+                      }
+                      data.put("children", ch)
+                  }
+                  if (args.hasFlag("ancestors")) {
+                      val anc = JSONArray()
+                      var cur = n.parent
+                      while (cur != null) { anc.put(nodeToJson(svc.nodeRegistry, cur, 0, compact = true)); cur = cur.parent }
+                      data.put("ancestors", anc)
+                  }
+                  return ok(args, data)
+              }
+
+              private fun uiScreenshot(args: OffloadArgs, sessionId: String? = null): NativeOffloadResult {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                      return err(args, "NOT_SUPPORTED",
+                          "ui screenshot requires Android 11 (API 30); use `android-shizuku-cli exec screencap` instead.")
+                  }
+                  val svc = svcOrThrow()
+                  val scale = (args.getDouble("scale") ?: 0.5).toFloat().coerceIn(0.05f, 1.0f)
+                  val displayId = args.getInt("display") ?: Display.DEFAULT_DISPLAY
+                  val inline = args.hasFlag("inline", "b")
+
+                  var shot = svc.captureScreenshot(displayId)
+                  var raw = shot.bitmap
+                      ?: return err(args, shot.errorCode ?: "TAKE_SCREENSHOT_FAILED",
+                          shot.errorMessage ?: "takeScreenshot failed")
+
+                  var origW = raw.width
+                  var origH = raw.height
+                  var scene = ScreenWords.analyzeScene(svc, raw, origW, origH)
+                  var waitLoading = 0
+                  while (scene.isLoadingOverlay && waitLoading < 4) {
+                      raw.recycle()
+                      Thread.sleep(600)
+                      shot = svc.captureScreenshot(displayId)
+                      val nextBmp = shot.bitmap ?: break
+                      raw = nextBmp
+                      origW = raw.width
+                      origH = raw.height
+                      scene = ScreenWords.analyzeScene(svc, raw, origW, origH)
+                      waitLoading++
+                  }
+
+                  val w = (origW * scale).toInt().coerceAtLeast(1)
+                  val h = (origH * scale).toInt().coerceAtLeast(1)
+                  val scaledBase = if (scale == 1.0f) raw else Bitmap.createScaledBitmap(raw, w, h, true)
+                  val annotated = scaledBase.copy(Bitmap.Config.ARGB_8888, true)
+                  if (scaledBase !== raw) scaledBase.recycle()
+                  raw.recycle()
+
+                  drawA11yFastVisionOverlay(annotated, scene, lastA11yTapPx, origW, origH)
+
+                  val baos = java.io.ByteArrayOutputStream()
+                  annotated.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                  val outW = annotated.width
+                  val outH = annotated.height
+                  annotated.recycle()
+                  val imgBytes = baos.toByteArray()
+
+                  val data = JSONObject()
+                      .put("displayId", displayId)
+                      .put("originalWidth", origW)
+                      .put("originalHeight", origH)
+                      .put("scaledWidth", outW)
+                      .put("scaledHeight", outH)
+                      .put("scale", scale.toDouble())
+                      .put("sizeBytes", imgBytes.size)
+                      .put("fastVisionState", scene.promptSummary)
+
+                  if (inline) {
+                      data.put("encoding", "jpeg+base64")
+                      data.put("base64", android.util.Base64.encodeToString(imgBytes, android.util.Base64.NO_WRAP))
+                      return ok(args, data)
+                  }
+
+                  return try {
+                      // 1. Write to the Linux sandbox's shared session attachments path (/var/minis/attachments/a11y/screen_latest.jpg)
+                      //    so `read_image` and Linux commands read it with ZERO path conflict!
+                      val attachBase = if (!sessionId.isNullOrBlank()) {
+                          java.io.File(context.filesDir, "minis-sessions/$sessionId/attachments/a11y")
+                      } else {
+                          PRootKernel.resolveHostPath("/var/minis/attachments")?.let { java.io.File(it, "a11y") }
+                      }
+                      var linuxPath = "/var/minis/shared/screen_latest.jpg"
+                      if (attachBase != null) {
+                          attachBase.mkdirs()
+                          val latestAttach = java.io.File(attachBase, "screen_latest.jpg")
+                          java.io.FileOutputStream(latestAttach).use { it.write(imgBytes) }
+                          linuxPath = "/var/minis/attachments/a11y/screen_latest.jpg"
+                      }
+                      // 2. Also write to /var/minis/shared/screen_latest.jpg as a session-independent Linux fallback
+                      PRootKernel.resolveHostPath("/var/minis/shared")?.let { sharedDir ->
+                          sharedDir.mkdirs()
+                          java.io.FileOutputStream(java.io.File(sharedDir, "screen_latest.jpg")).use { it.write(imgBytes) }
+                      }
+                      // 3. Keep host fallback in externalFilesDir
+                      val hostDir = (context.getExternalFilesDir("a11y_screenshots") ?: java.io.File(context.cacheDir, "a11y_screenshots"))
+                      hostDir.mkdirs()
+                      val hostFile = java.io.File(hostDir, "a11y_${System.currentTimeMillis()}.jpg")
+                      java.io.FileOutputStream(hostFile).use { it.write(imgBytes) }
+
+                      data.put("path", linuxPath)
+                      data.put("linuxPath", linuxPath)
+                      data.put("sharedPath", "/var/minis/shared/screen_latest.jpg")
+                      data.put("minisUrl", "minis://attachments/a11y/screen_latest.jpg")
+                      data.put("hostPath", hostFile.absolutePath)
+                      ok(args, data)
+                  } catch (t: Throwable) {
+                      AppLogger.warning(TAG, "screenshot write failed: ${t.message}")
+                      err(args, "WRITE_FAILED", "failed to write screenshot: ${t.javaClass.simpleName}: ${t.message ?: ""}")
+                  }
+              }
+
+              private fun drawA11yFastVisionOverlay(
+                  bmp: Bitmap,
+                  scene: ScreenWords.LocalSceneState,
+                  lastTap: Pair<Int, Int>?,
+                  screenW: Int,
+                  screenH: Int,
+              ) {
+                  val w = bmp.width.toFloat()
+                  val h = bmp.height.toFloat()
+                  if (w < 100f || h < 100f) return
+                  val canvas = Canvas(bmp)
+                  val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(105, 255, 235, 59)
+                      strokeWidth = 1.1f
+                      style = Paint.Style.STROKE
+                  }
+                  val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(170, 15, 15, 15)
+                      style = Paint.Style.FILL
+                  }
+                  val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(240, 255, 241, 118)
+                      textSize = (w * 0.021f).coerceIn(10f, 14f)
+                      typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  }
+                  val gxSteps = intArrayOf(125, 250, 375, 500, 625, 750, 875)
+                  val gySteps = intArrayOf(100, 200, 300, 400, 500, 600, 700, 800, 900)
+                  for (gx in gxSteps) {
+                      val px = gx * w / 1000f
+                      canvas.drawLine(px, 0f, px, h, linePaint)
+                  }
+                  for (gy in gySteps) {
+                      val py = gy * h / 1000f
+                      canvas.drawLine(0f, py, w, py, linePaint)
+                  }
+                  val fm = textPaint.fontMetrics
+                  val textH = fm.descent - fm.ascent
+                  for (gy in gySteps) {
+                      val py = gy * h / 1000f
+                      for (gx in gxSteps) {
+                          val px = gx * w / 1000f
+                          val label = "$gx,$gy"
+                          val textW = textPaint.measureText(label)
+                          val rect = RectF(
+                              px - textW / 2f - 2.5f,
+                              py - textH / 2f - 1f,
+                              px + textW / 2f + 2.5f,
+                              py + textH / 2f + 1f,
+                          )
+                          canvas.drawRoundRect(rect, 3f, 3f, bgPaint)
+                          canvas.drawText(label, px - textW / 2f, py - (fm.ascent + fm.descent) / 2f, textPaint)
+                      }
+                  }
+                  val idBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(210, 0, 77, 64)
+                      style = Paint.Style.FILL
+                  }
+                  val idTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.WHITE
+                      textSize = (w * 0.023f).coerceIn(11f, 15f)
+                      typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  }
+                  for (obj in scene.objects) {
+                      if (obj.id == "green_btn" || (obj.id.startsWith("c") && obj.freeOrEyes)) {
+                          val ox = obj.gx * w / 1000f
+                          val oy = obj.gy * h / 1000f
+                          val tag = "${obj.id}[${obj.gx},${obj.gy}]"
+                          val tw = idTextPaint.measureText(tag)
+                          val rect = RectF(ox - tw / 2f - 4f, oy - textH / 2f - 2f, ox + tw / 2f + 4f, oy + textH / 2f + 2f)
+                          canvas.drawRoundRect(rect, 4f, 4f, idBgPaint)
+                          canvas.drawText(tag, ox - tw / 2f, oy - (fm.ascent + fm.descent) / 2f, idTextPaint)
+                      }
+                  }
+                  if (lastTap != null && screenW > 0 && screenH > 0) {
+                      val tx = lastTap.first * w / screenW
+                      val ty = lastTap.second * h / screenH
+                      val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          color = Color.argb(235, 0, 229, 255)
+                          strokeWidth = 3f
+                          style = Paint.Style.STROKE
+                      }
+                      val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          color = Color.argb(235, 255, 23, 68)
+                          style = Paint.Style.FILL
+                      }
+                      canvas.drawCircle(tx, ty, 14f, ringPaint)
+                      canvas.drawCircle(tx, ty, 4.5f, dotPaint)
+                  }
+              }
+
+              // ── tap ──────────────────────────────────────────────────────────────
+
+              private fun tapSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null    -> NativeOffloadResult(2, TAP_HELP)
+                      "batch" -> tapBatch(args)
+                      "node"  -> tapNode(args)
+                      "xy"    -> tapXY(args)
+                      "text"  -> tapText(args)
+                      "id"    -> tapId(args)
+                      else    -> NativeOffloadResult(2, "$TOOL tap: unknown action\n$TAP_HELP")
+                  }
+              }
+
+              /**
+               * `android-a11y-cli tap batch <target1> <target2> ... [--gap 150]`
+               * Executes up to 12 taps at human response speed (150ms interval) with Touch Contract
+               * protection. Each target can be a tracked ID (`green_btn`, `c1`, `u1`), a 0–999 grid
+               * coordinate `gx,gy` (e.g. `500,768`), or an exact UI label (`"6"`, `"0"`, `"+"`, `"="`).
+               */
+              private fun tapBatch(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val rawTargets = args.positional.drop(2).flatMap { token ->
+                      if (token.contains(":")) token.split(":").filter { it.isNotBlank() } else listOf(token)
+                  }.take(12)
+                  if (rawTargets.isEmpty()) return NativeOffloadResult(2, "$TOOL tap batch: provide 1..12 targets (e.g. `tap batch 500,768` or `tap batch u12 u20 u20`)\n")
+
+                  val gapMs = (args.getLong("gap") ?: 150L).coerceIn(80L, 600L)
+                  val dm = context.resources.displayMetrics
+                  var screenW = dm.widthPixels.coerceAtLeast(1080)
+                  var screenH = dm.heightPixels.coerceAtLeast(2400)
+                  var shotBmp: Bitmap? = null
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      shotBmp = svc.captureScreenshot(Display.DEFAULT_DISPLAY, 2_500).bitmap
+                      if (shotBmp != null) {
+                          screenW = shotBmp.width
+                          screenH = shotBmp.height
+                      }
+                  }
+                  val dummyBmp = shotBmp ?: Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+                  val scene = ScreenWords.analyzeScene(svc, dummyBmp, screenW, screenH)
+
+                  val resultsArr = JSONArray()
+                  try {
+                      for ((idx, item) in rawTargets.withIndex()) {
+                          if (idx > 0) Thread.sleep(gapMs)
+                          val token = item.trim()
+                          val action: HandsAction.Click = if (token.contains(",")) {
+                              val parts = token.split(",")
+                              val xVal = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: 500
+                              val yVal = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 500
+                              // If coordinates are > 999, convert from physical pixels to 0-999 grid; otherwise treat as 0-999 grid
+                              val gx = if (xVal > 999 || yVal > 999) (xVal * 1000 / screenW).coerceIn(0, 999) else xVal.coerceIn(0, 999)
+                              val gy = if (xVal > 999 || yVal > 999) (yVal * 1000 / screenH).coerceIn(0, 999) else yVal.coerceIn(0, 999)
+                              HandsAction.Click(HandsAction.Point(gx, gy), token)
+                          } else if (scene.byId.containsKey(token.lowercase())) {
+                              val tr = scene.byId[token.lowercase()]!!
+                              HandsAction.Click(HandsAction.Point(tr.gx, tr.gy), tr.label, objectId = tr.id)
+                          } else {
+                              val matchedUi = scene.objects.firstOrNull { it.matchesTarget(token) }
+                              if (matchedUi != null) {
+                                  HandsAction.Click(HandsAction.Point(matchedUi.gx, matchedUi.gy), matchedUi.label, objectId = matchedUi.id)
+                              } else {
+                                  resultsArr.put(JSONObject().put("target", token).put("ok", false).put("error", "TARGET_NOT_FOUND"))
+                                  continue
+                              }
+                          }
+
+                          val resolved = ScreenWords.resolveWithContract(svc, shotBmp, scene, action, screenW, screenH)
+                          if (resolved.vetoReason != null) {
+                              resultsArr.put(JSONObject().put("target", token).put("ok", false).put("veto", resolved.vetoReason))
+                              break
+                          }
+                          val path = Path().apply {
+                              moveTo(resolved.px.toFloat(), resolved.py.toFloat())
+                              lineTo(resolved.px.toFloat() + 0.5f, resolved.py.toFloat() + 0.5f)
+                          }
+                          val okTap = svc.dispatchSimpleGesture(path, 0L, 60L)
+                          lastA11yTapPx = resolved.px to resolved.py
+                          resultsArr.put(
+                              JSONObject()
+                                  .put("target", token)
+                                  .put("ok", okTap)
+                                  .put("requested", resolved.resolvedFrom)
+                                  .put("injectedX", resolved.px)
+                                  .put("injectedY", resolved.py)
+                                  .put("underFinger", resolved.underFingerDesc)
+                          )
+                      }
+                  } finally {
+                      runCatching { dummyBmp.recycle() }
+                  }
+                  return ok(args, JSONObject().put("count", resultsArr.length()).put("results", resultsArr))
+              }
+
+              private fun tapNode(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL tap node: missing <nodeId>\n")
+                  val n = svc.nodeRegistry.get(nodeId)
+                      ?: return err(args, "NODE_NOT_FOUND", "no live node with id=$nodeId")
+                  val action = if (args.hasFlag("long")) AccessibilityNodeInfo.ACTION_LONG_CLICK
+                               else AccessibilityNodeInfo.ACTION_CLICK
+                  if (!n.isClickable && !args.hasFlag("long")) {
+                      val r = Rect(); n.getBoundsInScreen(r)
+                      return tapXYRaw(svc, r.centerX(), r.centerY(), args)
+                  }
+                  return if (n.performAction(action))
+                      ok(args, JSONObject().put("nodeId", nodeId).put("action", "click"))
+                  else err(args, "ACTION_FAILED", "performAction($action) returned false")
+              }
+
+              private fun tapXY(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val x = args.positional.getOrNull(2)?.toIntOrNull()
+                      ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <x>\n")
+                  val y = args.positional.getOrNull(3)?.toIntOrNull()
+                      ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <y>\n")
+                  return tapXYRaw(svc, x, y, args)
+              }
+
+              private fun tapXYRaw(svc: MinisAccessibilityService, x: Int, y: Int, args: OffloadArgs): NativeOffloadResult {
+                  val duration = args.getLong("duration") ?: if (args.hasFlag("long")) 1000L else 50L
+                  val path = Path().apply {
+                      moveTo(x.toFloat(), y.toFloat())
+                      lineTo(x.toFloat() + 0.1f, y.toFloat() + 0.1f)
+                  }
+                  val gestureOk = svc.dispatchSimpleGesture(path, 0L, duration)
+                  if (args.hasFlag("double")) {
+                      Thread.sleep(80)
+                      svc.dispatchSimpleGesture(path, 0L, duration)
+                  }
+                  return if (gestureOk) ok(args, JSONObject().put("x", x).put("y", y).put("action", "tap"))
+                  else err(args, "GESTURE_FAILED", "dispatchGesture returned cancelled / timed out")
+              }
+
+              private fun tapText(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val text = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL tap text: missing <text>\n")
+                  val contains = args.hasFlag("contains")
+                  val index = args.getInt("index") ?: 0
+                  val matches = ArrayList<AccessibilityNodeInfo>()
+                  for (root in svc.rootNodes()) findByTextOrDesc(root, text, contains, 30, 0, matches)
+                  val n = matches.getOrNull(index)
+                      ?: return err(args, "NODE_NOT_FOUND",
+                          "no node with text${if (contains) " containing " else "="}\"$text\" (matches: ${matches.size})")
+                  if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                  else {
+                      val r = Rect(); n.getBoundsInScreen(r)
+                      tapXYRaw(svc, r.centerX(), r.centerY(), args)
+                  }
+                  return ok(args, JSONObject().put("text", text).put("action", "click"))
+              }
+
+              private fun findByTextOrDesc(
+                  node: AccessibilityNodeInfo?, target: String, contains: Boolean,
+                  maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>,
+              ) {
+                  if (node == null || depth > maxDepth) return
+                  val t = node.text?.toString()
+                  val d = node.contentDescription?.toString()
+                  val match = if (contains)
+                      (t != null && t.contains(target)) || (d != null && d.contains(target))
+                  else
+                      t == target || d == target
+                  if (match) out.add(node)
+                  for (i in 0 until node.childCount) findByTextOrDesc(node.getChild(i), target, contains, maxDepth, depth + 1, out)
+              }
+
+              private fun tapId(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val rid = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL tap id: missing <resourceId>\n")
+                  val matches = ArrayList<AccessibilityNodeInfo>()
+                  for (root in svc.rootNodes()) findByResourceId(root, rid, 30, 0, matches)
+                  val n = matches.firstOrNull()
+                      ?: return err(args, "NODE_NOT_FOUND", "no node with resource-id=$rid")
+                  return if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+                      ok(args, JSONObject().put("resourceId", rid).put("action", "click"))
+                  else err(args, "ACTION_FAILED", "performAction(CLICK) returned false")
+              }
+
+              private fun findByResourceId(
+                  node: AccessibilityNodeInfo?, rid: String,
+                  maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>,
+              ) {
+                  if (node == null || depth > maxDepth) return
+                  if (node.viewIdResourceName == rid) out.add(node)
+                  for (i in 0 until node.childCount) findByResourceId(node.getChild(i), rid, maxDepth, depth + 1, out)
+              }
+
+              // ── input ────────────────────────────────────────────────────────────
+
+              private fun inputSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null    -> NativeOffloadResult(2, INPUT_HELP)
+                      "text"  -> inputText(args)
+                      "clear" -> inputClear(args)
+                      "key"   -> inputKey(args)
+                      else    -> NativeOffloadResult(2, "$TOOL input: unknown action\n$INPUT_HELP")
+                  }
+              }
+
+              private fun inputText(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val text = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL input text: missing <text>\n")
+                  val node = resolveTargetEditable(svc, args)
+                      ?: return err(args, "NODE_NOT_FOUND", "no editable focus and no --node specified")
+                  val finalText = when {
+                      args.hasFlag("clear")  -> text
+                      args.hasFlag("append") -> (node.text?.toString() ?: "") + text
+                      else                   -> text
+                  }
+                  return if (svc.setNodeText(node, finalText))
+                      ok(args, JSONObject().put("text", finalText).put("action", "setText"))
+                  else err(args, "ACTION_FAILED", "ACTION_SET_TEXT failed (node may not be editable)")
+              }
+
+              private fun inputClear(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val node = resolveTargetEditable(svc, args)
+                      ?: return err(args, "NODE_NOT_FOUND", "no editable focus and no --node specified")
+                  return if (svc.setNodeText(node, ""))
+                      ok(args, JSONObject().put("action", "clear"))
+                  else err(args, "ACTION_FAILED", "ACTION_SET_TEXT('') failed")
+              }
+
+              private fun inputKey(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val keyName = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL input key: missing <keycode>\n")
+                  return when (keyName.uppercase()) {
+                      "BACK" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK); ok(args, JSONObject().put("key", "BACK")) }
+                      "HOME" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME); ok(args, JSONObject().put("key", "HOME")) }
+                      "RECENTS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS); ok(args, JSONObject().put("key", "RECENTS")) }
+                      "NOTIFICATIONS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS); ok(args, JSONObject().put("key", "NOTIFICATIONS")) }
+                      else -> err(args, "INVALID_ARGS",
+                          "key '$keyName' not supported via accessibility (try BACK/HOME/RECENTS/NOTIFICATIONS; for ENTER/DPAD use shizuku-cli `input keyevent`)")
+                  }
+              }
+
+              private fun resolveTargetEditable(svc: MinisAccessibilityService, args: OffloadArgs): AccessibilityNodeInfo? {
+                  args.get("node")?.let { id -> return svc.nodeRegistry.get(id) }
+                  for (root in svc.rootNodes()) {
+                      val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                      if (focused != null) return focused
+                  }
+                  return null
+              }
+
+              // ── scroll ───────────────────────────────────────────────────────────
+
+              private fun scrollSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null      -> NativeOffloadResult(2, SCROLL_HELP)
+                      "node"    -> scrollNode(args)
+                      "xy"      -> scrollXY(args)
+                      "to-text" -> scrollToText(args)
+                      else      -> NativeOffloadResult(2, "$TOOL scroll: unknown action\n$SCROLL_HELP")
+                  }
+              }
+
+              private fun scrollNode(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL scroll node: missing <nodeId>\n")
+                  val n = svc.nodeRegistry.get(nodeId)
+                      ?: return err(args, "NODE_NOT_FOUND", "no live node with id=$nodeId")
+                  val direction = args.get("direction") ?: "down"
+                  val times = args.getInt("times") ?: 1
+                  val action = when (direction) {
+                      "down", "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                      "up", "left"    -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                      else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
+                  }
+                  var done = 0
+                  repeat(times) { if (n.performAction(action)) done++ }
+                  return ok(args, JSONObject().put("scrolled", done).put("direction", direction))
+              }
+
+              private fun scrollXY(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val x = args.positional.getOrNull(2)?.toIntOrNull()
+                      ?: return NativeOffloadResult(2, "$TOOL scroll xy: missing <x>\n")
+                  val y = args.positional.getOrNull(3)?.toIntOrNull()
+                      ?: return NativeOffloadResult(2, "$TOOL scroll xy: missing <y>\n")
+                  val direction = args.get("direction") ?: "down"
+                  val distance = args.getInt("distance") ?: 500
+                  val duration = args.getLong("duration") ?: 300L
+                  val (dx, dy) = when (direction) {
+                      "down"  -> 0 to -distance
+                      "up"    -> 0 to distance
+                      "left"  -> distance to 0
+                      "right" -> -distance to 0
+                      else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
+                  }
+                  val path = Path().apply { moveTo(x.toFloat(), y.toFloat()); lineTo((x + dx).toFloat(), (y + dy).toFloat()) }
+                  return if (svc.dispatchSimpleGesture(path, 0L, duration))
+                      ok(args, JSONObject().put("direction", direction).put("distance", distance))
+                  else err(args, "GESTURE_FAILED", "scroll gesture cancelled")
+              }
+
+              private fun scrollToText(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val text = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL scroll to-text: missing <text>\n")
+                  val maxScrolls = args.getInt("max-scrolls") ?: 10
+                  val direction = args.get("direction") ?: "down"
+                  val containerId = args.get("container")
+                  val container: AccessibilityNodeInfo? = containerId?.let { svc.nodeRegistry.get(it) }
+                  val action = when (direction) {
+                      "down", "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                      "up", "left"    -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                      else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
+                  }
+                  repeat(maxScrolls) {
+                      val matches = ArrayList<AccessibilityNodeInfo>()
+                      for (root in svc.rootNodes()) findByTextOrDesc(root, text, contains = true, 30, 0, matches)
+                      val hit = matches.firstOrNull()
+                      if (hit != null) return ok(args, JSONObject()
+                          .put("found", true)
+                          .put("node", nodeToJson(svc.nodeRegistry, hit, 0, compact = true)))
+                      val scrolled = container?.performAction(action) ?: run {
+                          var any = false
+                          for (root in svc.rootNodes()) {
+                              val s = firstScrollable(root, 30, 0)
+                              if (s != null) { any = s.performAction(action); break }
+                          }
+                          any
+                      }
+                      if (!scrolled) return ok(args, JSONObject().put("found", false).put("reason", "scroll_action_rejected"))
+                      Thread.sleep(400)
+                  }
+                  return ok(args, JSONObject().put("found", false))
+              }
+
+              private fun firstScrollable(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int): AccessibilityNodeInfo? {
+                  if (node == null || depth > maxDepth) return null
+                  if (node.isScrollable) return node
+                  for (i in 0 until node.childCount) firstScrollable(node.getChild(i), maxDepth, depth + 1)?.let { return it }
+                  return null
+              }
+
+              // ── gesture ──────────────────────────────────────────────────────────
+
+              private fun gestureSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null    -> NativeOffloadResult(2, GESTURE_HELP)
+                      "swipe" -> gestureSwipe(args)
+                      "pinch" -> gesturePinch(args)
+                      "path"  -> gesturePath(args)
+                      else    -> NativeOffloadResult(2, "$TOOL gesture: unknown action\n$GESTURE_HELP")
+                  }
+              }
+
+              private fun gestureSwipe(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val x1 = args.positional.getOrNull(2)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <x1>\n")
+                  val y1 = args.positional.getOrNull(3)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <y1>\n")
+                  val x2 = args.positional.getOrNull(4)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <x2>\n")
+                  val y2 = args.positional.getOrNull(5)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <y2>\n")
+                  val duration = args.getLong("duration") ?: 300L
+                  val path = Path().apply { moveTo(x1.toFloat(), y1.toFloat()); lineTo(x2.toFloat(), y2.toFloat()) }
+                  return if (svc.dispatchSimpleGesture(path, 0L, duration))
+                      ok(args, JSONObject().put("from", JSONArray().put(x1).put(y1)).put("to", JSONArray().put(x2).put(y2)))
+                  else err(args, "GESTURE_FAILED", "swipe cancelled")
+              }
+
+              private fun gesturePinch(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val cx = args.positional.getOrNull(2)?.toFloatOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture pinch: missing <cx>\n")
+                  val cy = args.positional.getOrNull(3)?.toFloatOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture pinch: missing <cy>\n")
+                  val scale = args.getDouble("scale")?.toFloat() ?: 0.5f
+                  val duration = args.getLong("duration") ?: 300L
+                  return if (svc.dispatchPinch(cx, cy, scale, duration))
+                      ok(args, JSONObject().put("center", JSONArray().put(cx).put(cy)).put("scale", scale))
+                  else err(args, "GESTURE_FAILED", "pinch cancelled")
+              }
+
+              private fun gesturePath(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val pointsStr = args.positional.getOrNull(2)
+                      ?: return NativeOffloadResult(2, "$TOOL gesture path: missing <points>\n")
+                  val pts = pointsStr.split(":").map {
+                      val xy = it.split(","); if (xy.size != 2) return err(args, "INVALID_ARGS", "bad points: $it")
+                      xy[0].toFloat() to xy[1].toFloat()
+                  }
+                  if (pts.size < 2) return err(args, "INVALID_ARGS", "need >= 2 points")
+                  val path = Path().apply {
+                      moveTo(pts[0].first, pts[0].second)
+                      for (i in 1 until pts.size) lineTo(pts[i].first, pts[i].second)
+                  }
+                  val duration = args.getLong("duration") ?: (pts.size * 100L)
+                  return if (svc.dispatchSimpleGesture(path, 0L, duration))
+                      ok(args, JSONObject().put("points", pts.size))
+                  else err(args, "GESTURE_FAILED", "path cancelled")
+              }
+
+              // ── wait ─────────────────────────────────────────────────────────────
+
+              private fun waitSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null         -> NativeOffloadResult(2, WAIT_HELP)
+                      "appear"     -> waitAppear(args, present = true)
+                      "disappear"  -> waitAppear(args, present = false)
+                      "stable"     -> waitStable(args)
+                      "activity"   -> waitActivity(args)
+                      else         -> NativeOffloadResult(2, "$TOOL wait: unknown action\n$WAIT_HELP")
+                  }
+              }
+
+              private fun waitAppear(args: OffloadArgs, present: Boolean): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val timeout = args.getLong("timeout") ?: 10_000L
+                  val deadline = System.currentTimeMillis() + timeout
+                  val targetText = args.get("text") ?: args.get("text-contains")
+                  val containsOnly = args.get("text-contains") != null
+                  val targetId = args.get("id")
+                  val targetClass = args.get("class")
+                  while (System.currentTimeMillis() < deadline) {
+                      for (root in svc.rootNodes()) {
+                          val matches = ArrayList<AccessibilityNodeInfo>()
+                          if (targetText != null) findByTextOrDesc(root, targetText, contains = containsOnly, 30, 0, matches)
+                          if (targetId != null) findByResourceId(root, targetId, 30, 0, matches)
+                          if (targetClass != null) findByClassName(root, targetClass, 30, 0, matches)
+                          val found = matches.isNotEmpty()
+                          if (found == present) {
+                              return if (present) ok(args, JSONObject().put("found", true)
+                                  .put("node", nodeToJson(svc.nodeRegistry, matches.first(), 0, compact = true)))
+                              else ok(args, JSONObject().put("disappeared", true))
+                          }
+                      }
+                      Thread.sleep(200)
+                  }
+                  return ok(args, JSONObject().put("found", false).put("timedOut", true))
+              }
+
+              private fun findByClassName(node: AccessibilityNodeInfo?, cls: String, maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>) {
+                  if (node == null || depth > maxDepth) return
+                  if (node.className?.toString() == cls) out.add(node)
+                  for (i in 0 until node.childCount) findByClassName(node.getChild(i), cls, maxDepth, depth + 1, out)
+              }
+
+              private fun waitStable(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val interval = args.getLong("interval") ?: 200L
+                  val stableDuration = args.getLong("duration") ?: 500L
+                  val timeout = args.getLong("timeout") ?: 8000L
+                  val start = System.currentTimeMillis()
+                  val deadline = start + timeout
+                  var lastSig = treeSignature(svc)
+                  var stableSince = System.currentTimeMillis()
+                  while (System.currentTimeMillis() < deadline) {
+                      Thread.sleep(interval)
+                      val sig = treeSignature(svc)
+                      if (sig != lastSig) { lastSig = sig; stableSince = System.currentTimeMillis() }
+                      else if (System.currentTimeMillis() - stableSince >= stableDuration) {
+                          return ok(args, JSONObject().put("stable", true).put("waitedMs", System.currentTimeMillis() - start))
+                      }
+                  }
+                  return ok(args, JSONObject().put("stable", false).put("timedOut", true))
+              }
+
+              private fun treeSignature(svc: MinisAccessibilityService): Int {
+                  var h = 0
+                  for (root in svc.rootNodes()) {
+                      h = h * 31 + (root.text?.hashCode() ?: 0)
+                      h = h * 31 + root.childCount
+                      h = h * 31 + root.windowId
+                  }
+                  val (pkg, cls) = svc.foregroundPackage()
+                  h = h * 31 + (pkg?.hashCode() ?: 0)
+                  h = h * 31 + (cls?.hashCode() ?: 0)
+                  return h
+              }
+
+              private fun waitActivity(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val timeout = args.getLong("timeout") ?: 10_000L
+                  val pkg = args.get("package")
+                  val act = args.get("activity")
+                  val deadline = System.currentTimeMillis() + timeout
+                  while (System.currentTimeMillis() < deadline) {
+                      val (p, c) = svc.foregroundPackage()
+                      val pkgOk = pkg == null || p == pkg
+                      val actOk = act == null || c == act || (act.startsWith(".") && (c?.endsWith(act) == true))
+                      if (pkgOk && actOk) return ok(args, JSONObject().put("packageName", p ?: "").put("activityName", c ?: ""))
+                      Thread.sleep(200)
+                  }
+                  return ok(args, JSONObject().put("timedOut", true))
+              }
+
+              // ── event / notify / dialog ──────────────────────────────────────────
+
+              private fun eventSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null    -> NativeOffloadResult(2, EVENT_HELP)
+                      "watch" -> eventWatch(args, once = false)
+                      "once"  -> eventWatch(args, once = true)
+                      else    -> NativeOffloadResult(2, "$TOOL event: unknown action\n$EVENT_HELP")
+                  }
+              }
+
+              private fun eventWatch(args: OffloadArgs, once: Boolean): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val duration = if (once) (args.getLong("timeout") ?: 30_000L)
+                                 else (args.getLong("duration") ?: 30_000L)
+                  val typeFilter = args.get("type")?.split(",")?.map(String::trim)?.toSet()
+                  val pkgFilter = args.get("package")
+                  val textContains = args.get("text-contains")
+                  val sb = StringBuilder()
+                  val deadline = System.currentTimeMillis() + duration.coerceAtMost(120_000L)
+                  val collected = java.util.concurrent.ConcurrentLinkedQueue<MinisAccessibilityService.RecordedEvent>()
+                  val listener: (MinisAccessibilityService.RecordedEvent) -> Unit = { collected.offer(it) }
+                  svc.addEventListener(listener)
+                  try {
+                      while (System.currentTimeMillis() < deadline) {
+                          while (true) {
+                              val ev = collected.poll() ?: break
+                              val typeName = ev.type.lowercase().removePrefix("typeview").removePrefix("type")
+                              if (typeFilter != null && typeFilter.none { typeName.contains(it.lowercase()) }) continue
+                              if (pkgFilter != null && ev.packageName != pkgFilter) continue
+                              if (textContains != null && (ev.text?.contains(textContains) != true)) continue
+                              val obj = JSONObject()
+                                  .put("type", typeName)
+                                  .put("packageName", ev.packageName ?: "")
+                                  .put("className", ev.className ?: "")
+                                  .put("text", ev.text ?: "")
+                                  .put("timestamp", ev.timestamp)
+                              sb.append(obj.toString()).append('\n')
+                              if (once) return NativeOffloadResult(0, sb.toString())
+                          }
+                          Thread.sleep(50)
+                      }
+                  } finally {
+                      svc.removeEventListener(listener)
+                  }
+                  return NativeOffloadResult(0, sb.toString())
+              }
+
+              private fun notifySub(args: OffloadArgs): NativeOffloadResult {
+                  val sub = args.positional.getOrNull(1)
+                  if (sub != "watch" && sub != "once") {
+                      return NativeOffloadResult(2, "$TOOL notify: unknown action\n$NOTIFY_HELP")
+                  }
+                  // Reuse eventWatch with forced type filter.
+                  val newArgv = mutableListOf("event", sub)
+                  args.get("package")?.let { newArgv += listOf("--package", it) }
+                  args.get("text-contains")?.let { newArgv += listOf("--text-contains", it) }
+                  args.get("duration")?.let { newArgv += listOf("--duration", it) }
+                  args.get("timeout")?.let { newArgv += listOf("--timeout", it) }
+                  newArgv += listOf("--type", "notification_state_changed")
+                  if (args.hasFlag("compact")) newArgv += "--compact"
+                  return eventWatch(OffloadArgs(newArgv), once = sub == "once")
+              }
+
+              private fun dialogSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null      -> NativeOffloadResult(2, DIALOG_HELP)
+                      "detect"  -> dialogDetect(args)
+                      "dismiss" -> dialogDismiss(args)
+                      "watch"   -> err(args, "NOT_IMPLEMENTED", "dialog watch: not implemented in v1; poll `dialog detect` instead")
+                      else      -> NativeOffloadResult(2, "$TOOL dialog: unknown action\n$DIALOG_HELP")
+                  }
+              }
+
+              private fun dialogDetect(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  var dialog: AccessibilityNodeInfo? = null
+                  for (root in svc.rootNodes()) {
+                      dialog = findFirstByClassNameContains(root, "Dialog", 30, 0)
+                      if (dialog != null) break
+                  }
+                  if (dialog == null) return ok(args, JSONObject().put("hasDialog", false))
+                  val buttons = JSONArray()
+                  collectClickableTexts(dialog, 10, 0, buttons, svc.nodeRegistry)
+                  val msg = StringBuilder()
+                  collectText(dialog, 5, 0, msg)
+                  return ok(args, JSONObject()
+                      .put("hasDialog", true)
+                      .put("type", "app_dialog")
+                      .put("title", "")
+                      .put("message", msg.toString().trim())
+                      .put("buttons", buttons))
+              }
+
+              private fun findFirstByClassNameContains(node: AccessibilityNodeInfo?, frag: String, maxDepth: Int, depth: Int): AccessibilityNodeInfo? {
+                  if (node == null || depth > maxDepth) return null
+                  if (node.className?.toString()?.contains(frag) == true) return node
+                  for (i in 0 until node.childCount) findFirstByClassNameContains(node.getChild(i), frag, maxDepth, depth + 1)?.let { return it }
+                  return null
+              }
+
+              private fun collectClickableTexts(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int, out: JSONArray, registry: NodeRegistry) {
+                  if (node == null || depth > maxDepth) return
+                  val t = node.text?.toString()
+                  if (node.isClickable && !t.isNullOrEmpty()) {
+                      out.put(JSONObject().put("text", t).put("nodeId", registry.put(node)))
+                  }
+                  for (i in 0 until node.childCount) collectClickableTexts(node.getChild(i), maxDepth, depth + 1, out, registry)
+              }
+
+              private fun collectText(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int, out: StringBuilder) {
+                  if (node == null || depth > maxDepth) return
+                  node.text?.toString()?.takeIf { it.isNotBlank() }?.let { out.append(it).append(' ') }
+                  for (i in 0 until node.childCount) collectText(node.getChild(i), maxDepth, depth + 1, out)
+              }
+
+              private fun dialogDismiss(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val confirm = args.hasFlag("confirm")
+                  val deny = args.hasFlag("deny")
+                  val explicit = args.get("button")
+                  val candidates = when {
+                      explicit != null -> listOf(explicit)
+                      confirm -> listOf("确认", "确定", "允许", "好", "是", "OK", "Allow", "Confirm", "Yes")
+                      deny    -> listOf("拒绝", "取消", "否", "不允许", "Cancel", "Deny", "No")
+                      else    -> listOf("取消", "关闭", "否", "Cancel", "Close")
+                  }
+                  for (label in candidates) {
+                      val matches = ArrayList<AccessibilityNodeInfo>()
+                      for (root in svc.rootNodes()) findByTextOrDesc(root, label, contains = false, 30, 0, matches)
+                      val btn = matches.firstOrNull { it.isClickable } ?: matches.firstOrNull()
+                      if (btn != null) {
+                          val clicked = if (btn.isClickable) btn.performAction(AccessibilityNodeInfo.ACTION_CLICK) else {
+                              val r = Rect(); btn.getBoundsInScreen(r)
+                              svc.dispatchSimpleGesture(
+                                  Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()); lineTo(r.exactCenterX() + 0.1f, r.exactCenterY() + 0.1f) },
+                                  0L, 50L
+                              )
+                          }
+                          if (clicked) return ok(args, JSONObject().put("dismissed", true).put("button", label))
+                      }
+                  }
+                  return err(args, "NODE_NOT_FOUND", "no matching dismiss button found (looked for: ${candidates.joinToString()})")
+              }
+
+              // ── extract ──────────────────────────────────────────────────────────
+
+              private fun extractSub(args: OffloadArgs): NativeOffloadResult {
+                  return when (args.positional.getOrNull(1)) {
+                      null    -> NativeOffloadResult(2, EXTRACT_HELP)
+                      "text"  -> extractText(args)
+                      "list"  -> extractList(args)
+                      "table" -> err(args, "NOT_IMPLEMENTED", "extract table: not implemented in v1")
+                      "form"  -> extractForm(args)
+                      else    -> NativeOffloadResult(2, "$TOOL extract: unknown action\n$EXTRACT_HELP")
+                  }
+              }
+
+              private fun extractText(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.get("node")
+                  val sep = args.get("separator") ?: "\n"
+                  val roots = if (nodeId != null) listOfNotNull(svc.nodeRegistry.get(nodeId)) else svc.rootNodes()
+                  if (roots.isEmpty()) return err(args, "NODE_NOT_FOUND", "no roots / node=$nodeId")
+                  val arr = JSONArray()
+                  val sb = StringBuilder()
+                  for (root in roots) collectVisibleText(root, 50, 0, arr, sb, sep)
+                  return if (args.get("format") == "json")
+                      ok(args, JSONObject().put("count", arr.length()).put("data", arr))
+                  else NativeOffloadResult(0, sb.toString())
+              }
+
+              private fun collectVisibleText(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int, arr: JSONArray, sb: StringBuilder, sep: String) {
+                  if (node == null || depth > maxDepth) return
+                  if (node.isVisibleToUser) {
+                      val t = node.text?.toString()
+                      if (!t.isNullOrBlank()) {
+                          val r = Rect(); node.getBoundsInScreen(r)
+                          arr.put(JSONObject().put("text", t).put("bounds", JSONObject()
+                              .put("left", r.left).put("top", r.top).put("right", r.right).put("bottom", r.bottom)))
+                          sb.append(t).append(sep)
+                      }
+                  }
+                  for (i in 0 until node.childCount) collectVisibleText(node.getChild(i), maxDepth, depth + 1, arr, sb, sep)
+              }
+
+              private fun extractList(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.get("node")
+                  val maxItems = args.getInt("max-items") ?: 100
+                  val autoScroll = args.hasFlag("auto-scroll")
+                  val container: AccessibilityNodeInfo = (nodeId?.let { svc.nodeRegistry.get(it) }) ?: run {
+                      var found: AccessibilityNodeInfo? = null
+                      for (root in svc.rootNodes()) { found = firstScrollable(root, 30, 0); if (found != null) break }
+                      found ?: return err(args, "NODE_NOT_FOUND", "no scrollable container; pass --node")
+                  }
+                  val items = LinkedHashMap<String, JSONObject>()
+                  var iter = 0
+                  do {
+                      for (i in 0 until container.childCount) {
+                          val child = container.getChild(i) ?: continue
+                          val sb = StringBuilder()
+                          collectText(child, 5, 0, sb)
+                          val text = sb.toString().trim()
+                          if (text.isNotEmpty()) {
+                              items.putIfAbsent(text, JSONObject().put("text", text).put("nodeId", svc.nodeRegistry.put(child)))
+                          }
+                          if (items.size >= maxItems) break
+                      }
+                      if (!autoScroll || items.size >= maxItems) break
+                      val scrolled = container.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                      if (!scrolled) break
+                      Thread.sleep(400)
+                      iter++
+                  } while (iter < 30)
+                  val arr = JSONArray()
+                  for (v in items.values) arr.put(v)
+                  return ok(args, JSONObject().put("count", arr.length()).put("data", arr))
+              }
+
+              private fun extractForm(args: OffloadArgs): NativeOffloadResult {
+                  val svc = svcOrThrow()
+                  val nodeId = args.get("node")
+                  val roots = if (nodeId != null) listOfNotNull(svc.nodeRegistry.get(nodeId)) else svc.rootNodes()
+                  val arr = JSONArray()
+                  for (root in roots) collectFormFields(root, 30, 0, arr, svc.nodeRegistry)
+                  return ok(args, JSONObject().put("count", arr.length()).put("data", arr))
+              }
+
+              private fun collectFormFields(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int, arr: JSONArray, registry: NodeRegistry) {
+                  if (node == null || depth > maxDepth) return
+                  if (node.isEditable || node.isCheckable) {
+                      val obj = JSONObject().put("nodeId", registry.put(node))
+                          .put("type", node.className?.toString() ?: "")
+                          .put("label", node.contentDescription?.toString() ?: node.hintText?.toString() ?: "")
+                      if (node.isEditable) obj.put("value", node.text?.toString() ?: "")
+                      if (node.isCheckable) obj.put("checked", node.isChecked)
+                      arr.put(obj)
+                  }
+                  for (i in 0 until node.childCount) collectFormFields(node.getChild(i), maxDepth, depth + 1, arr, registry)
+              }
+
+              // ── helpers ──────────────────────────────────────────────────────────
+
+              private class NotRunning(msg: String) : RuntimeException(msg)
+
+              private fun svcOrThrow(): MinisAccessibilityService =
+                  MinisAccessibilityService.getInstance()
+                      ?: throw NotRunning("Accessibility service is not running. Enable nanoMuse under Settings → Accessibility.")
+
+              private fun ok(args: OffloadArgs, data: Any): NativeOffloadResult {
+                  val body = JSONObject().put("ok", true).put("data", data).toString()
+                  return NativeOffloadResult(0, OffloadOutput.formatBody(body, args) + "\n")
+              }
+
+              private fun err(args: OffloadArgs, code: String, message: String, exit: Int = 1): NativeOffloadResult {
+                  val body = JSONObject().put("ok", false).put("error",
+                      JSONObject().put("code", code).put("message", message)).toString()
+                  return NativeOffloadResult(exit, OffloadOutput.formatBody(body, args) + "\n")
+              }
+
+              /**
+               * [T-bg-overlay phase 2 fix] Human-readable sub-action status surfaced
+               * to the background overlay + FGS notification while the a11y CLI is
+               * running. Format mirrors the CLI's own subcommand vocabulary so a
+               * developer reading logs sees the same thing the agent ran.
+               *
+               * Examples:
+               *   ui dump           → "a11y_cli: dumping UI tree"
+               *   tap by-text Login → "a11y_cli: tap \"Login\""
+               *   input set --text X → "a11y_cli: input text"
+               *   scroll forward    → "a11y_cli: scroll forward"
+               *   event watch       → "a11y_cli: watching events"
+               */
+              private fun statusForSubAction(sub: String, verb: String?, args: OffloadArgs): String {
+                  val v = verb ?: ""
+                  val target = args.positional.getOrNull(2)?.takeIf { it.isNotBlank() }
+                  return when (sub) {
+                      "ui" -> when (v) {
+                          "dump"       -> "a11y_cli: dumping UI tree"
+                          "find"       -> "a11y_cli: finding ${target ?: "element"}"
+                          "info"       -> "a11y_cli: reading UI info"
+                          "node"       -> "a11y_cli: reading node ${target ?: ""}".trim()
+                          "screenshot" -> "a11y_cli: capturing screenshot"
+                          else         -> "a11y_cli: ui"
+                      }
+                      "tap" -> when (v) {
+                          "by-text"     -> "a11y_cli: tap \"${target ?: ""}\""
+                          "by-id"       -> "a11y_cli: tap #${target ?: ""}"
+                          "by-node"     -> "a11y_cli: tap node ${target ?: ""}"
+                          "at"          -> "a11y_cli: tap at ($target)"
+                          else          -> "a11y_cli: tap"
+                      }
+                      "input" -> when (v) {
+                          "set"   -> "a11y_cli: input text"
+                          "clear" -> "a11y_cli: clearing input"
+                          else    -> "a11y_cli: input"
+                      }
+                      "scroll" -> when (v) {
+                          "forward", "backward", "up", "down" -> "a11y_cli: scroll $v"
+                          "to-text"                            -> "a11y_cli: scrolling to \"${target ?: ""}\""
+                          else                                 -> "a11y_cli: scroll"
+                      }
+                      "gesture"  -> "a11y_cli: gesture${v.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""}"
+                      "wait"     -> "a11y_cli: waiting for ${v.ifBlank { "condition" }}"
+                      "event"    -> if (v == "watch") "a11y_cli: watching events" else "a11y_cli: event $v"
+                      "notify"   -> if (v == "watch") "a11y_cli: watching notifications" else "a11y_cli: notify $v"
+                      "dialog"   -> "a11y_cli: dialog $v"
+                      "extract"  -> "a11y_cli: extracting ${v.ifBlank { "text" }}"
+                      "service"  -> "a11y_cli: service $v"
+                      else       -> "Running: a11y_cli $sub"
+                  }
+              }
+
+          }
+          EOF_A11Y_KT
 
       - name: Install Android NDK r27c & Build Native Dependencies
         run: |
