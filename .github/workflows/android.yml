@@ -315,6 +315,8 @@ jobs:
                   val id: String,
                   val kind: String,
                   val label: String,
+                  val rawText: String = "",
+                  val rawDesc: String = "",
                   val colorName: String,
                   val gx: Int,
                   val gy: Int,
@@ -324,7 +326,15 @@ jobs:
                   val boxGrid: IntArray, // [gx1, gy1, gx2, gy2]
                   val freeOrEyes: Boolean,
                   val clickable: Boolean,
-              )
+              ) {
+                  fun matchesTarget(q: String): Boolean {
+                      val t = q.trim()
+                      if (t.isEmpty()) return false
+                      return label.equals(t, ignoreCase = true) ||
+                          rawText.equals(t, ignoreCase = true) ||
+                          rawDesc.equals(t, ignoreCase = true)
+                  }
+              }
 
               data class LocalSceneState(
                   val objects: List<TrackedObject>,
@@ -436,19 +446,21 @@ jobs:
                   var boxPx: Rect? = null
                   var source = "coord[${pt.gx},${pt.gy}]"
 
+                  val rawPair = pt.toPixels(screenW, screenH)
+                  px = rawPair.first
+                  py = rawPair.second
+                  val hasExplicitCoord = !(pt.gx == 500 && pt.gy == 500 && objId.isNotEmpty())
+
                   val tracked = if (objId.isNotEmpty()) scene.byId[objId] else null
-                  if (tracked != null) {
+                  val trackedDist = if (tracked != null) hypot((tracked.tapX - px).toDouble(), (tracked.tapY - py).toDouble()) else Double.MAX_VALUE
+                  // Only trust `tracked` by ID if no explicit coordinate was given, OR if `tracked` is close to the coordinate,
+                  // OR if `tracked` explicitly matches `target` (prevents a wrong `uN` ID from hijacking a Calculator digit tap!)
+                  if (tracked != null && (!hasExplicitCoord || trackedDist <= screenH * 0.12 || tracked.matchesTarget(target))) {
                       px = tracked.tapX.coerceIn(tracked.boxPx.left, (tracked.boxPx.right - 1).coerceAtLeast(tracked.boxPx.left))
                       py = tracked.tapY.coerceIn(tracked.boxPx.top, (tracked.boxPx.bottom - 1).coerceAtLeast(tracked.boxPx.top))
                       boxPx = tracked.boxPx
                       source = "id:$objId->(${px},${py})"
                   } else {
-                      val rawPair = pt.toPixels(screenW, screenH)
-                      px = rawPair.first
-                      py = rawPair.second
-
-                      // If targeting "Level N" / "Continue" / "Play" and green_btn is detected near that region,
-                      // clamp inside green_btn's bounding box so it hits the green button cleanly.
                       val tLower = target.lowercase()
                       val greenBtn = scene.byId["green_btn"]
                       if (greenBtn != null &&
@@ -460,18 +472,17 @@ jobs:
                           boxPx = greenBtn.boxPx
                           source = "green_btn->(${px},${py})"
                       } else if (target.isNotEmpty() && !scene.isGameCanvas) {
-                          // Only in standard UI apps (like Clone Space), if an EXACT label match is within 10%
-                          // of screen height (e.g. tapping text label just below the app icon), snap to the icon center.
-                          // NEVER snap across screen zones!
+                          // In standard UI apps (Calculator, Clone Space, etc.), find UI elements whose text/desc/label matches `target`
                           val exactUi = scene.objects.filter {
-                              it.id.startsWith("u") && it.label.equals(target, ignoreCase = true)
+                              it.id.startsWith("u") && it.matchesTarget(target)
                           }
                           val nearUi = exactUi.minByOrNull { hypot((it.tapX - px).toDouble(), (it.tapY - py).toDouble()) }
-                          if (nearUi != null && hypot((nearUi.tapX - px).toDouble(), (nearUi.tapY - py).toDouble()) <= screenH * 0.10) {
+                          // Snap if within 12% of screen height (e.g. Calculator button or Clone Space icon+label)
+                          if (nearUi != null && hypot((nearUi.tapX - px).toDouble(), (nearUi.tapY - py).toDouble()) <= screenH * 0.12) {
                               px = nearUi.tapX
                               py = nearUi.tapY
                               boxPx = nearUi.boxPx
-                              source = "ui_icon:${nearUi.id}->(${px},${py})"
+                              source = "ui_match:${nearUi.id}->(${px},${py})"
                           }
                       }
                   }
@@ -899,11 +910,15 @@ jobs:
                                       (tapBounds.right * 1000 / screenW).coerceIn(0, 999),
                                       (tapBounds.bottom * 1000 / screenH).coerceIn(0, 999),
                                   )
+                                  val rText = node.text?.toString()?.trim().orEmpty()
+                                  val rDesc = node.contentDescription?.toString()?.trim().orEmpty()
                                   out.add(
                                       TrackedObject(
                                           id = "u0",
                                           kind = simpleClass,
                                           label = lbl.take(60),
+                                          rawText = rText.take(40),
+                                          rawDesc = rDesc.take(40),
                                           colorName = "ui",
                                           gx = gx,
                                           gy = gy,
@@ -932,7 +947,18 @@ jobs:
                   screenW: Int,
                   screenH: Int,
               ): TapTargetInfo {
-                  var clickable = node.isClickable
+                  val clsName = node.className?.toString().orEmpty()
+                  // CRITICAL FIX FOR CALCULATOR / KEYPADS / STANDARD BUTTONS:
+                  // If the node itself is already clickable or is a Button/EditText, its tap point is ALWAYS
+                  // its own exact center (bounds.centerX(), bounds.centerY()) — never shift it to a parent or sibling!
+                  if (node.isClickable || node.isEditable || clsName.contains("Button", ignoreCase = true)) {
+                      return TapTargetInfo(bounds.centerX(), bounds.centerY(), bounds, true)
+                  }
+                  // Only for non-clickable single-line text labels (like app names below icons in Clone Space):
+                  if (bounds.height() > screenH / 16) {
+                      return TapTargetInfo(bounds.centerX(), bounds.centerY(), bounds, node.isClickable)
+                  }
+                  var clickable = false
                   var p: AccessibilityNodeInfo? = node.parent
                   var up = 0
                   while (p != null && up < 3) {
@@ -1664,12 +1690,6 @@ jobs:
                               if (batchIdx > 0) {
                                   val gap = if (action is HandsAction.Click) action.gapMs else BATCH_GAP_MS
                                   Thread.sleep(gap)
-                                  // Refresh local tracker frame in <40ms before the next tap in a batch so moving cars are tracked live!
-                                  screenshotFast(svc)?.let { fresh ->
-                                      if (activeShot !== shot) activeShot.recycle()
-                                      activeShot = fresh
-                                      activeScene = ScreenWords.analyzeScene(svc, activeShot, screenW, screenH)
-                                  }
                               }
 
                               // ── the same thing again on the same screen? ──
@@ -1744,28 +1764,8 @@ jobs:
                                       capsule.stage.ripple(px, py)
                                       lastInjectedTap = px to py
 
-                                      // Fast-Hand Local Acceptance & 1-Retry Check (`hands-fast-vision.md` Section 3):
-                                      // For single taps or green_btn / game pieces, check after 220ms whether the piece moved;
-                                      // if not, retry once slightly higher (-18px) strictly inside its bounding box!
-                                      var retriedNote = ""
-                                      if (ok && action is HandsAction.Click && !batch) {
-                                          Thread.sleep(220)
-                                          val checkBmp = screenshotFast(svc)
-                                          if (checkBmp != null) {
-                                              val patchAfter = sampleLocalPatch(checkBmp, px, py, screenW, screenH)
-                                              val accepted = patchMoved(patchBefore, patchAfter)
-                                              checkBmp.recycle()
-                                              if (!accepted) {
-                                                  val retryY = resolved.boxPx?.let { (py - 18).coerceIn(it.top + 4, (it.bottom - 4).coerceAtLeast(it.top + 4)) }
-                                                      ?: (py - 18).coerceAtLeast(0)
-                                                  ok = capsule.passThrough { tap(svc, px, retryY, 65) }
-                                                  lastInjectedTap = px to retryY
-                                                  py = retryY
-                                                  retriedNote = " (1 local retry at ($px,$py))"
-                                                  Thread.sleep(160)
-                                              }
-                                          }
-                                      } else {
+                                      val retriedNote = ""
+                                      if (!batch || batchIdx == actions.size - 1) {
                                           Thread.sleep(settleTap)
                                       }
 
