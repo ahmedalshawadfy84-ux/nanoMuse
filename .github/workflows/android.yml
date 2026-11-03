@@ -1287,7 +1287,7 @@ jobs:
                           "open_app" -> OpenApp(o.optString("app_name").ifBlank { o.optString("app") }.ifBlank { o.optString("name") }.trim())
                           "navigate_back" -> Back
                           "navigate_home" -> Home
-                          "wait" -> Wait(o.optDouble("seconds", 1.0).toInt().coerceIn(1, 10))
+                          "wait" -> Wait(o.optDouble("seconds", 2.0).toInt().coerceIn(1, 10))
                           "take_over" -> TakeOver(o.optString("reason").ifBlank { o.optString("message") })
                           "ask_user" -> AskUser(o.optString("question").ifBlank { o.optString("text") })
                           "status" -> {
